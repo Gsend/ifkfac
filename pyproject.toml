@@ -7,16 +7,31 @@ name = "ifkfac"
 version = "0.1.0"
 description = "Inverse-Free K-FAC — a numerically stable, QR-based K-FAC optimizer for PyTorch"
 readme = "README.md"
-license = { file = "LICENSE/MIT" }
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [
+  { name = "Gilad Senderovich", email = "giladsnd@gmail.com" },
+]
+keywords = ["kfac", "k-fac", "optimizer", "natural-gradient", "pytorch", "second-order", "bf16"]
 dependencies = [
   "torch>=2.0",
 ]
 classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Gsend/ifkfac"
+Repository = "https://github.com/Gsend/ifkfac"
+Issues = "https://github.com/Gsend/ifkfac/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]

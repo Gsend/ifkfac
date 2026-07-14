@@ -36,6 +36,10 @@ pip install -e ".[test,demo]"
 
 Requires PyTorch ≥ 2.0.
 
+> **Not yet on PyPI.** `pip install ifkfac` does not work today — install from
+> source as above. See [Publishing to PyPI](#publishing-to-pypi) for what it
+> would take to make `pip install ifkfac` available.
+
 ## Quick start
 
 ```python
@@ -57,6 +61,68 @@ for x, y in loader:
 
 The same three hyperparameters as Classic K-FAC: `lr`, `damping`, and
 `factor_update_freq`. No new tuning burden.
+
+## Training in fp32 or bf16
+
+Precision is controlled by a single constructor flag, `use_true_bf16`. In both
+modes the model's **master weights stay in fp32** — the flag only changes the
+dtype in which IFKFAC stores its `R` factors and runs the triangular solves.
+The natural gradient is always cast back to fp32 before the weight update, so
+this is the standard mixed-precision pattern (bf16 curvature, fp32 weights).
+
+### fp32 (default)
+
+```python
+from ifkfac import IFKFAC
+
+model = build_model().cuda()                 # fp32 parameters
+optimizer = IFKFAC(model, lr=1e-3, damping=1e-2)   # use_true_bf16=False (default)
+
+for x, y in loader:
+    x, y = x.cuda(), y.cuda()
+    loss = F.cross_entropy(model(x), y)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+```
+
+### bf16
+
+Keep the model in fp32 and set `use_true_bf16=True`. IFKFAC then stores `R_X`
+and `R_G` as bfloat16 and routes QR / triangular solves through the hand-rolled
+bf16 primitives in `ifkfac.bf16_linalg` (cuSOLVER lacks bf16 `geqrf` /
+`triangular_solve` / `cholesky`). This is the regime where IFKFAC's `O(κ · ε)`
+stability matters — Classic K-FAC's `O(κ² · ε)` error saturates here.
+
+```python
+from ifkfac import IFKFAC
+
+model = build_model().cuda()                 # master weights remain fp32
+optimizer = IFKFAC(
+    model,
+    lr=1e-3,
+    damping=1e-2,
+    use_true_bf16=True,                      # store R factors as bf16 — saves memory
+)
+
+for x, y in loader:
+    x, y = x.cuda(), y.cuda()
+    # Optional: run the forward/backward under bf16 autocast as usual.
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = F.cross_entropy(model(x), y)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+```
+
+The two modes take identical hyperparameters — switching precision is just the
+one flag, no re-tuning of `lr` / `damping` / `factor_update_freq`.
+
+To see both side by side on a small problem:
+
+```bash
+python demo/demo_train_mlp.py --precision all     # fp32 and bf16 cells
+```
 
 ## Usage patterns
 
@@ -157,6 +223,59 @@ python demo/demo_train_mlp.py --precision bf16
 Trains a 4-layer MLP on synthetic data with both IFKFAC and Classic K-FAC at
 bf16. Reproduces the headline κ²/κ contrast on a small problem in ~30 seconds.
 
+## Publishing to PyPI
+
+To make the library installable with `pip install ifkfac`, the following needs
+to happen. The packaging is already 90% there — `pyproject.toml` uses a
+standard PEP 621 layout with the setuptools backend — so most of this is
+process, not code.
+
+**1. Confirm the distribution name is available.** Check
+[pypi.org/project/ifkfac](https://pypi.org/project/ifkfac/). If `ifkfac` is
+taken, pick another `name` in `pyproject.toml` (the import package stays
+`ifkfac` regardless).
+
+**2. Tighten `pyproject.toml` metadata** so the PyPI project page renders well
+and installs resolve correctly:
+- Fill in real `authors = [{ name = "...", email = "..." }]` (currently the
+  citation and author fields are placeholders).
+- Add `[project.urls]` (Homepage / Repository / Issues) — these become the
+  sidebar links on the PyPI page.
+- Set `readme = "README.md"` (already present) so this file becomes the long
+  description.
+- Consider adding `"Development Status"`, `"Operating System"`, and Python
+  minor-version classifiers.
+
+**3. Decide the Torch dependency story.** `torch>=2.0` is fine as a floor, but
+PyPI wheels of torch are CPU/CUDA-variant specific. Leave the dependency loose
+and document that GPU users should install the matching torch build from the
+official index first. Don't pin a `+cuXXX` build in `dependencies`.
+
+**4. Build the distributions:**
+
+```bash
+python -m pip install --upgrade build twine
+python -m build            # produces dist/ifkfac-0.1.0-py3-none-any.whl + .tar.gz
+twine check dist/*         # validates metadata / long-description rendering
+```
+
+**5. Upload — test first, then real:**
+
+```bash
+twine upload --repository testpypi dist/*    # dry run on test.pypi.org
+pip install -i https://test.pypi.org/simple/ ifkfac   # verify the install
+twine upload dist/*                          # publish to the real PyPI
+```
+
+Use a PyPI **API token** (recommended) or, better, configure
+[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) so a GitHub
+Actions workflow can publish on tagged releases without storing secrets.
+
+**6. (Recommended) Automate releases.** Add a GitHub Actions workflow that, on
+a version tag (e.g. `v0.1.0`), runs `python -m build` and `pypi-publish` via
+OIDC Trusted Publishing. Bump `version` in `pyproject.toml` for every release —
+PyPI refuses to overwrite an already-published version.
+
 ## Citation
 
 If you use IFKFAC in research, please cite:
@@ -171,4 +290,4 @@ If you use IFKFAC in research, please cite:
 
 ## License
 
-MIT (see LICENSE/MIT).
+MIT (see [LICENSE](LICENSE)).
