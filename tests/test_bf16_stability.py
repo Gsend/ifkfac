@@ -41,7 +41,13 @@ def _classic_natural_gradient(X, dY, grad_W, damping, precision):
     G_aug = G + damping * torch.eye(G.shape[0], dtype=G.dtype)
     A_inv = torch.linalg.inv(A_aug)
     G_inv = torch.linalg.inv(G_aug)
-    return G_inv.to(torch.float64) @ grad_W @ A_inv.to(torch.float64)
+    # The factor pipeline above runs at the test precision; the final product is
+    # promoted so the fp64 comparison measures error from the factorisation, not
+    # from this matmul.  grad_W has to be promoted with the inverses — callers
+    # pass it at the same precision as X, so leaving it out is a dtype mismatch.
+    return (G_inv.to(torch.float64)
+            @ grad_W.to(torch.float64)
+            @ A_inv.to(torch.float64))
 
 
 def _ifkfac_natural_gradient(X, dY, grad_W, damping, precision):
@@ -64,7 +70,10 @@ def _ifkfac_natural_gradient(X, dY, grad_W, damping, precision):
     A_inv = A_inv @ torch.linalg.solve_triangular(R_X.t(), Id_in, upper=False)
     G_inv = torch.linalg.solve_triangular(R_G, Id_out, upper=True)
     G_inv = G_inv @ torch.linalg.solve_triangular(R_G.t(), Id_out, upper=False)
-    return G_inv.to(torch.float64) @ grad_W @ A_inv.to(torch.float64)
+    # Promoted for the same reason as in _classic_natural_gradient.
+    return (G_inv.to(torch.float64)
+            @ grad_W.to(torch.float64)
+            @ A_inv.to(torch.float64))
 
 
 def _rel_err(approx, exact):

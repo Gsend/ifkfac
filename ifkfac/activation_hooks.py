@@ -438,12 +438,22 @@ class RawActivationHooks(GramMatrixEstimator):
             logger.debug("_drain_one_bucket: n=%d B=%d max_p=%d", n, B, max_p)
 
         # Pad each chunk to (max_p, n) with zeros, then stack -> (B, max_p, n).
+        # Keep the chunks' own dtype here (bf16 under AMP) — the promotion to
+        # fp32 happens once inside the QR, so this staging buffer stays half-size.
         padded = torch.zeros(B, max_p, n, device=device, dtype=dtype)
         for i, c in enumerate(merged_chunks):
             padded[i, :c.shape[0]] = c
 
         # Build running_R stack: (B, n, n) with zeros for first-call layers.
-        running_stack = torch.zeros(B, n, n, device=device, dtype=dtype)
+        # The running factors are fp32 accumulators (see triangular._qr), so this
+        # buffer must match them — allocating it at the chunk dtype would round
+        # every prior R back down to bf16 on assignment.
+        r_dtype = torch.float32
+        for m in modules:
+            if running[m] is not None:
+                r_dtype = running[m].dtype
+                break
+        running_stack = torch.zeros(B, n, n, device=device, dtype=r_dtype)
         for i, m in enumerate(modules):
             R_old = running[m]
             if R_old is not None:
@@ -487,20 +497,83 @@ class RawActivationHooks(GramMatrixEstimator):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _unfold_conv_input(x: torch.Tensor, module: nn.Conv2d) -> torch.Tensor:
+    def _conv_out_hw(module: nn.Conv2d, hw) -> Optional[Tuple[int, int]]:
+        """Spatial output size of ``module`` for an input of size ``hw``.
+
+        Returns None when ``padding`` is a string ('same' / 'valid'), where the
+        arithmetic below does not apply; callers then fall back to capping rows
+        after the unfold.
+        """
+        if isinstance(module.padding, str):
+            return None
+        out = []
+        for i in range(2):
+            k, s = module.kernel_size[i], module.stride[i]
+            p, d = module.padding[i], module.dilation[i]
+            out.append((hw[i] + 2 * p - d * (k - 1) - 1) // s + 1)
+        return out[0], out[1]
+
+    @staticmethod
+    def _spatial_subsample_factor(total_rows: int, max_rows: int) -> int:
+        """Stride multiplier that brings ``total_rows`` under ``max_rows``.
+
+        Both spatial axes are subsampled, so rows scale as 1/s².
+        """
+        if max_rows <= 0 or total_rows <= max_rows:
+            return 1
+        return max(1, math.ceil(math.sqrt(total_rows / max_rows)))
+
+    @classmethod
+    def _unfold_conv_input(cls, x: torch.Tensor, module: nn.Conv2d,
+                           max_rows: int = 0) -> torch.Tensor:
+        """im2col of a conv input, subsampled *before* materialisation.
+
+        F.unfold expands (B, C_in, H, W) into (B, C_in·kH·kW, L), and the
+        permute + reshape that follows copies it again.  For a UNet encoder that
+        is multiple GB per layer per step (64 imgs × 576 cols × 65536 locations
+        in bf16 = 4.8 GB), so capping rows *after* the unfold — as this used to
+        do — still paid the full allocation on every forward pass.
+
+        Subsampling by raising the unfold stride to a multiple of the conv's own
+        stride yields an exact subset of the true patches (locations at multiples
+        of s·stride are a subset of those at multiples of stride), never
+        materialises the large tensor, and keeps every image in the batch
+        represented — which slicing whole images off the front would not.
+        """
+        stride = tuple(module.stride)
+        out_hw = cls._conv_out_hw(module, x.shape[-2:])
+        if max_rows > 0 and out_hw is not None:
+            total = x.shape[0] * out_hw[0] * out_hw[1]
+            s = cls._spatial_subsample_factor(total, max_rows)
+            if s > 1:
+                stride = tuple(v * s for v in stride)
+
         x_unf = F.unfold(
             x,
             kernel_size=module.kernel_size,
             dilation=module.dilation,
             padding=module.padding,
-            stride=module.stride,
+            stride=stride,
         )   # (B, C_in·kH·kW, L)
         B, C_kk, L = x_unf.shape
         return x_unf.permute(0, 2, 1).reshape(B * L, C_kk)
 
-    @staticmethod
-    def _reshape_conv_grad(delta: torch.Tensor) -> torch.Tensor:
+    @classmethod
+    def _reshape_conv_grad(cls, delta: torch.Tensor,
+                           max_rows: int = 0) -> torch.Tensor:
+        """Flatten (B, C_out, H, W) gradients into (B·H·W, C_out) rows.
+
+        Same allocation problem as _unfold_conv_input: permute + reshape on a
+        non-contiguous tensor copies the whole thing, so the subsampling has to
+        happen first.  Each row is one spatial location's C_out vector, so
+        striding the H/W axes selects an exact subset of rows taken from every
+        image in the batch.
+        """
         B, C_out, H_out, W_out = delta.shape
+        s = cls._spatial_subsample_factor(B * H_out * W_out, max_rows)
+        if s > 1:
+            delta = delta[:, :, ::s, ::s]
+            B, C_out, H_out, W_out = delta.shape
         return delta.permute(0, 2, 3, 1).reshape(B * H_out * W_out, C_out)
 
     # ------------------------------------------------------------------
@@ -520,11 +593,13 @@ class RawActivationHooks(GramMatrixEstimator):
         raw_shape = tuple(x.shape)
 
         if isinstance(module, nn.Conv2d):
-            x = self._unfold_conv_input(x, module)   # (B·L, C_in·kH·kW)
             # Spatial patches are highly correlated — subsample to cap the leaf
             # QR size.  Without this, a CIFAR-10 conv layer produces 8192 rows
             # per batch (128 images × 64 spatial locations), making streaming
-            # TSQR the per-step bottleneck even on GPU.
+            # TSQR the per-step bottleneck even on GPU.  The subsampling runs
+            # inside the unfold so the im2col intermediate is never allocated at
+            # full size; the randperm below only mops up the ceil() slack.
+            x = self._unfold_conv_input(x, module, self.max_conv_rows)
             if self.max_conv_rows > 0 and x.shape[0] > self.max_conv_rows:
                 idx = torch.randperm(x.shape[0], device=x.device)[:self.max_conv_rows]
                 x = x[idx]
@@ -602,7 +677,13 @@ class RawActivationHooks(GramMatrixEstimator):
         raw_shape = tuple(delta.shape)
 
         if isinstance(module, nn.Conv2d):
-            delta = self._reshape_conv_grad(delta)    # (B·L, C_out)
+            # As in the forward hook: subsample spatially before the reshape so
+            # the (B·H·W, C_out) copy is never made at full size.
+            delta = self._reshape_conv_grad(delta, self.max_conv_rows)
+            if self.max_conv_rows > 0 and delta.shape[0] > self.max_conv_rows:
+                idx = torch.randperm(delta.shape[0],
+                                     device=delta.device)[:self.max_conv_rows]
+                delta = delta[idx]
         elif delta.ndim > 2:
             delta = delta.reshape(-1, delta.shape[-1])  # (B·T, d_out)
             # KFAC-Reduce on output gradients - mirror the forward-hook subsample.

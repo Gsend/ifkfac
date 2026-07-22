@@ -70,7 +70,9 @@ import torch
 import torch.nn as nn
 
 from ifkfac.activation_hooks import RawActivationHooks, IFKFACRankError
-from ifkfac.triangular import apply_vered, apply_vered_bias, apply_vered_batched
+from ifkfac.triangular import (
+    apply_vered, apply_vered_bias, apply_vered_batched, _qr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -268,10 +270,15 @@ class IFKFAC(torch.optim.Optimizer):
                     R_X_old, R_G_old = self._factors[module]
                     # Exact augmented-QR blend for both factors
                     def _blend(R_old, R_new):
+                        # R_old comes from self._factors, which is bf16 when
+                        # use_true_bf16 is set — _qr promotes it (no bf16 geqrf)
+                        # and the blend runs in fp32; the downcast for storage
+                        # happens further down, once.
                         aug = torch.cat(
-                            [sqrt_g * R_old, sqrt_1g * R_new], dim=0
+                            [sqrt_g * R_old.float(), sqrt_1g * R_new.float()],
+                            dim=0,
                         )
-                        _, R_b = torch.linalg.qr(aug, mode="reduced")
+                        _, R_b = _qr(aug, mode="reduced")
                         # Positive-diagonal sign normalisation
                         diag_signs = torch.sign(torch.diagonal(R_b))
                         diag_signs[diag_signs == 0] = 1.0

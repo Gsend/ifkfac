@@ -82,6 +82,30 @@ class _TS:
         )
 
 
+_LOW_PRECISION = (torch.bfloat16, torch.float16)
+
+
+def _qr(M: torch.Tensor, mode: str = "reduced") -> tuple[torch.Tensor, torch.Tensor]:
+    """torch.linalg.qr with an fp32 upcast for low-precision inputs.
+
+    Neither LAPACK nor cuSOLVER implements ``geqrf`` for bfloat16 / float16 —
+    ``torch.linalg.qr`` raises "not implemented for 'BFloat16'" on both CPU and
+    CUDA.  Under AMP the activations reaching the hooks are bf16, so every QR
+    site in this module has to promote.
+
+    The result is deliberately returned in **fp32, not the input dtype**.
+    ``streaming_tsqr_update`` folds one chunk per forward pass into a running R,
+    so rounding the accumulator back to bf16 after every merge compounds over
+    hundreds of chunks — which would throw away exactly the κ(X)-vs-κ(X)²
+    advantage this module exists to provide (see module docstring).  R is only
+    O(n²), so an fp32 accumulator is cheap.  Downcasting to bf16 for *storage*
+    still happens at the end of the pipeline when ``use_true_bf16`` is set.
+    """
+    if M.dtype in _LOW_PRECISION:
+        M = M.float()
+    return torch.linalg.qr(M, mode=mode)
+
+
 # ---------------------------------------------------------------------------
 # 1. SGSO — CPU reference only
 # ---------------------------------------------------------------------------
@@ -188,7 +212,7 @@ def tsqr(M: torch.Tensor, tile_size: int = 512) -> torch.Tensor:
 
     if len(tiles) == 1:
         # Single tile — direct QR, no tree needed
-        _, R = torch.linalg.qr(tiles[0], mode="reduced")
+        _, R = _qr(tiles[0], mode="reduced")
         return _positive_diagonal_R(R)
 
     # Pad last tile if shorter than tile_size so we can stack uniformly
@@ -199,7 +223,7 @@ def tsqr(M: torch.Tensor, tile_size: int = 512) -> torch.Tensor:
         tiles = tiles[:-1] + (last_padded,)
 
     tile_stack = torch.stack(list(tiles), dim=0)      # (num_tiles, tile_size, n)
-    _, R_batch = torch.linalg.qr(tile_stack, mode="reduced")  # (num_tiles, n, n)
+    _, R_batch = _qr(tile_stack, mode="reduced")      # (num_tiles, n, n)
     Rs: list[torch.Tensor] = list(R_batch.unbind(0))  # num_tiles × (n, n)
 
     # ---- Tree merge ----
@@ -209,7 +233,7 @@ def tsqr(M: torch.Tensor, tile_size: int = 512) -> torch.Tensor:
         for i in range(0, len(Rs), 2):
             if i + 1 < len(Rs):
                 pair = torch.cat([Rs[i], Rs[i + 1]], dim=0)   # (2n, n)
-                _, R_merged = torch.linalg.qr(pair, mode="reduced")
+                _, R_merged = _qr(pair, mode="reduced")
                 merged.append(R_merged)
             else:
                 merged.append(Rs[i])   # odd one out — carry forward
@@ -280,8 +304,9 @@ def streaming_tsqr_update(
                      "None (first chunk)" if is_first
                      else f"shape={tuple(running_R.shape)}")
 
-    # Leaf QR of the new chunk
-    _, R_new = torch.linalg.qr(new_chunk, mode="reduced")
+    # Leaf QR of the new chunk.  _qr promotes bf16/fp16 and returns fp32, so
+    # the running accumulator stays fp32 no matter what dtype the hooks feed us.
+    _, R_new = _qr(new_chunk, mode="reduced")
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("streaming_tsqr_update() leaf QR: R_new.shape=%s  "
@@ -295,9 +320,13 @@ def streaming_tsqr_update(
                          _TS(result, "R"))
         return result
 
-    # Merge step
+    # Merge step.  running_R may still be low precision if it was restored from
+    # a bf16 checkpoint; align both operands before cat (mixed-dtype cat would
+    # silently promote, but being explicit keeps the QR input dtype obvious).
+    if running_R.dtype != R_new.dtype:
+        running_R = running_R.to(R_new.dtype)
     pair = torch.cat([running_R, R_new], dim=0)               # (2n, n)
-    _, R_merged = torch.linalg.qr(pair, mode="reduced")       # (n, n)
+    _, R_merged = _qr(pair, mode="reduced")                   # (n, n)
     result = _positive_diagonal_R(R_merged)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("streaming_tsqr_update() done (merged): %s  "
@@ -369,12 +398,15 @@ def batched_streaming_tsqr_update(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("batched_streaming_tsqr_update: B=%d p=%d n=%d", B, p, n)
 
-    # Stage 1: batched leaf QR  (B, p, n) -> (B, n, n)
-    _, R_leaf = torch.linalg.qr(new_chunks, mode="reduced")
+    # Stage 1: batched leaf QR  (B, p, n) -> (B, n, n).  _qr promotes bf16/fp16
+    # (no batched geqrf kernel for either) and returns fp32.
+    _, R_leaf = _qr(new_chunks, mode="reduced")
 
     # Stage 2: batched merge QR  cat[(B,n,n), (B,n,n)] = (B, 2n, n) -> (B, n, n)
+    if running_R.dtype != R_leaf.dtype:
+        running_R = running_R.to(R_leaf.dtype)
     pair = torch.cat([running_R, R_leaf], dim=1)
-    _, R_merged = torch.linalg.qr(pair, mode="reduced")
+    _, R_merged = _qr(pair, mode="reduced")
 
     return _positive_diagonal_R_batched(R_merged)
 
@@ -408,11 +440,16 @@ def finalize_R(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("finalize_R() called: %s  damping=%.4g",
                      _TS(running_R, "running_R"), damping)
+    # Build the ridge rows in fp32 regardless of the accumulator dtype: √λ for a
+    # small λ (1e-2 → 0.1) carries only ~3 significant digits in bf16, which
+    # would perturb the damping by ~0.4% before the QR even runs.
+    qr_dtype = (torch.float32 if running_R.dtype in _LOW_PRECISION
+                else running_R.dtype)
     damp_rows = (damping ** 0.5) * torch.eye(
-        n, device=running_R.device, dtype=running_R.dtype
+        n, device=running_R.device, dtype=qr_dtype
     )
-    pair = torch.cat([running_R, damp_rows], dim=0)           # (2n, n)
-    _, R_damped = torch.linalg.qr(pair, mode="reduced")       # (n, n)
+    pair = torch.cat([running_R.to(qr_dtype), damp_rows], dim=0)   # (2n, n)
+    _, R_damped = _qr(pair, mode="reduced")                        # (n, n)
     result = _positive_diagonal_R(R_damped)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("finalize_R() done: %s  diag_min=%.4g diag_max=%.4g",
@@ -531,10 +568,12 @@ def apply_vered_batched(
     assert R_X.shape[0] == B and R_G.shape[0] == B, \
         f"batch dims mismatch: grad_W={grad_W.shape[0]}, R_X={R_X.shape[0]}, R_G={R_G.shape[0]}"
 
-    # bf16-storage dispatch.  Loop over the bucket and route through
-    # apply_vered which now uses fp32 cuSOLVER internally for bf16-stored R.
-    # The CUDA-graph fast path is fp32-only and skipped here.
-    if R_X.dtype == torch.bfloat16 or R_G.dtype == torch.bfloat16:
+    # Low-precision dispatch.  Loop over the bucket and route through
+    # apply_vered, which uses fp32 cuSOLVER internally for bf16-stored R and
+    # reconciles a low-precision grad_W against fp32 R accumulators.  The
+    # CUDA-graph fast path is fp32-only and skipped here.
+    if (grad_W.dtype in _LOW_PRECISION
+            or grad_W.dtype != R_X.dtype or grad_W.dtype != R_G.dtype):
         return torch.stack([apply_vered(grad_W[i], R_X[i], R_G[i])
                               for i in range(B)], dim=0)
 
@@ -627,6 +666,20 @@ def apply_vered(
         T4_T = torch.linalg.solve_triangular(R_X32,    T3_T,   upper=True)
         return T4_T.t().contiguous().to(grad_dtype)
 
+    # ---- Dtype alignment ----
+    # The R factors are fp32 accumulators (see _qr) while grad_W carries the
+    # model's parameter dtype — fp32 under AMP, where master weights stay fp32,
+    # but bf16 for a model that was cast wholesale.  solve_triangular requires
+    # every operand to share one dtype, and has no bf16/fp16 kernel of its own.
+    out_dtype = grad_W.dtype
+    solve_dtype = torch.promote_types(
+        torch.promote_types(R_X.dtype, R_G.dtype), grad_W.dtype)
+    if solve_dtype in _LOW_PRECISION:
+        solve_dtype = torch.float32
+    R_X = R_X.to(solve_dtype)
+    R_G = R_G.to(solve_dtype)
+    grad_W = grad_W.to(solve_dtype)
+
     # ---- Left: multiply by G⁻¹ = (R_Gᵀ R_G)⁻¹ ----
     # Step 1: solve R_Gᵀ T1 = grad_W   (lower triangular)
     T1 = torch.linalg.solve_triangular(R_G.T, grad_W, upper=False)   # (n_out, n_in)
@@ -653,7 +706,7 @@ def apply_vered(
         scale = (nat_grad.norm() / (grad_W.norm() + 1e-12)).item()
         logger.debug("apply_vered() done: %s  scale_vs_grad=%.4g×",
                      _TS(nat_grad, "nat_grad"), scale)
-    return nat_grad
+    return nat_grad.to(out_dtype)
 
 
 def apply_vered_bias(
@@ -697,9 +750,17 @@ def apply_vered_bias(
         return T2.squeeze(1).to(grad_dtype)
 
     gb = grad_b.unsqueeze(1)                                           # (n_out, 1)
+    # Dtype alignment — see the matching note in apply_vered.
+    out_dtype = grad_b.dtype
+    solve_dtype = torch.promote_types(R_G.dtype, grad_b.dtype)
+    if solve_dtype in _LOW_PRECISION:
+        solve_dtype = torch.float32
+    R_G = R_G.to(solve_dtype)
+    gb = gb.to(solve_dtype)
+
     T1 = torch.linalg.solve_triangular(R_G.T, gb, upper=False)        # (n_out, 1)
     T2 = torch.linalg.solve_triangular(R_G, T1, upper=True)           # (n_out, 1)
-    result = T2.squeeze(1)                                             # (n_out,)
+    result = T2.squeeze(1).to(out_dtype)                               # (n_out,)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("apply_vered_bias() done: %s", _TS(result, "nat_grad_b"))
     return result
