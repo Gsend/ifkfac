@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import pytest
 
 from ifkfac import IFKFAC
-from ifkfac.triangular import apply_vered, finalize_R
+from ifkfac.triangular import apply_ifkfac, finalize_R
 
 
 def _build_small_mlp(in_dim=16, hidden=32, out_dim=8, seed=42):
@@ -116,7 +116,7 @@ def test_preconditioner_gain_scales_as_inverse_damping_squared(damping):
     R = finalize_R(torch.eye(n) * 1e-4, damping)
     grad_W = torch.randn(n, n)
 
-    gain = (apply_vered(grad_W, R, R).norm() / grad_W.norm()).item()
+    gain = (apply_ifkfac(grad_W, R, R).norm() / grad_W.norm()).item()
 
     assert gain == pytest.approx(1.0 / damping ** 2, rel=0.05), (
         f"preconditioner gain {gain:.4g} != 1/λ² = {1.0 / damping ** 2:.4g}; "

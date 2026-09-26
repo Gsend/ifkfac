@@ -242,7 +242,7 @@ def test_hooks_get_factors(dtype, mode):
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=IDS)
 def test_ifkfac_step_on_conv_model(dtype):
-    """A full step(): hooks → get_factors → apply_vered → weight update.
+    """A full step(): hooks → get_factors → apply_ifkfac → weight update.
 
     Covers the dtype seam this fix introduced as well as the crash it removed:
     the R accumulators are fp32 while a wholesale-cast model produces bf16

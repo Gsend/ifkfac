@@ -92,7 +92,7 @@ class RawActivationHooks(GramMatrixEstimator):
 
     get_factors() returns (R_X, R_G) — upper-triangular factors — rather than
     the Gram matrices (A, G) returned by KFACHooks.  IFKFAC calls
-    apply_vered() which consumes these R factors directly via triangular solves.
+    apply_ifkfac() which consumes these R factors directly via triangular solves.
 
     Parameters
     ----------

@@ -42,7 +42,7 @@ logs a warning.
 GPU path
 --------
 The streaming TSQR in the hooks calls torch.linalg.qr (cuSOLVER Householder)
-on GPU — no custom kernels required.  The four triangular solves in apply_vered
+on GPU — no custom kernels required.  The four triangular solves in apply_ifkfac
 map to cuBLAS TRSM calls (already GPU-accelerated in PyTorch).
 
 Usage
@@ -71,7 +71,7 @@ import torch.nn as nn
 
 from ifkfac.activation_hooks import RawActivationHooks, IFKFACRankError
 from ifkfac.triangular import (
-    apply_vered, apply_vered_bias, apply_vered_batched, _qr,
+    apply_ifkfac, apply_ifkfac_bias, apply_ifkfac_batched, _qr,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,7 +113,7 @@ class IFKFAC(torch.optim.Optimizer):
     augment_bias : bool
         If True, append a ones column to input activations for layers with
         bias so the bias term is folded into the A factor.  Default: False.
-        Leave False to match ClassicKFAC's bias handling (apply_vered_bias
+        Leave False to match ClassicKFAC's bias handling (apply_ifkfac_bias
         with only the G factor, treating A=1 for the bias), which avoids
         the centred-covariance contamination that augmentation introduces.
     """
@@ -140,9 +140,9 @@ class IFKFAC(torch.optim.Optimizer):
             "IFKFAC init: factor_update_freq=%d  damping=%.2e  augment_bias=%s  batched_qr=%s  deferred_qr=%s  true_bf16=%s",
             factor_update_freq, damping, augment_bias, batched_qr, deferred_qr, use_true_bf16,
         )
-        # When True, store R_X and R_G as bfloat16 and use the hand-rolled
-        # primitives in optimizer.bf16_linalg for QR and triangular solves
-        # (since cuSOLVER lacks bf16 geqrf / triangular_solve / cholesky).
+        # When True, R_X and R_G are stored as bfloat16 between refreshes and
+        # upcast (losslessly) to fp32 for the four cuSOLVER triangular solves
+        # (cuSOLVER has no bf16 triangular solve).
         # The natural gradient is cast back to fp32 before the weight update
         # so master weights stay at fp32 (standard mixed-precision pattern).
         self.use_true_bf16 = use_true_bf16
@@ -292,9 +292,9 @@ class IFKFAC(torch.optim.Optimizer):
             clean = blended
 
         # If use_true_bf16 is enabled, downcast factors to bf16 BEFORE storage.
-        # apply_vered (see optimizer/sgso.py) dispatches on R.dtype and routes
-        # bf16 factors through the hand-rolled triangular-solve primitives in
-        # optimizer.bf16_linalg.  The natural-gradient output is cast back to
+        # apply_ifkfac (see optimizer/sgso.py) dispatches on R.dtype and upcasts
+        # bf16-stored factors to fp32 for the triangular solves
+        # (fp32 cuSOLVER; storage-only bf16).  The natural-gradient output is cast back to
         # fp32 (master-weights precision) before the weight update.
         if self.use_true_bf16:
             clean = {m: (R_X.to(torch.bfloat16), R_G.to(torch.bfloat16))
@@ -382,12 +382,12 @@ class IFKFAC(torch.optim.Optimizer):
             R_G_stack = torch.stack([self._factors[m][1] for m in modules], dim=0)
 
             try:
-                nat_grad_stack = apply_vered_batched(
+                nat_grad_stack = apply_ifkfac_batched(
                     grad_stack, R_X_stack, R_G_stack
                 )
             except Exception as e:
                 logger.warning(
-                    "IFKFAC: apply_vered_batched failed for bucket "
+                    "IFKFAC: apply_ifkfac_batched failed for bucket "
                     "(n_in=%d, n_out=%d, B=%d): %s — falling back to per-layer.",
                     n_in, n_out, B, e,
                 )
@@ -424,7 +424,7 @@ class IFKFAC(torch.optim.Optimizer):
                 # only, then decoupled wd.
                 if m.bias is not None and m.bias.grad is not None:
                     R_G = self._factors[m][1]
-                    nat_grad_b = apply_vered_bias(m.bias.grad, R_G)
+                    nat_grad_b = apply_ifkfac_bias(m.bias.grad, R_G)
                     if wd > 0:
                         m.bias.data.mul_(1.0 - lr * wd)
                     m.bias.data.add_(nat_grad_b, alpha=-lr)
@@ -487,10 +487,10 @@ class IFKFAC(torch.optim.Optimizer):
             grad_w = grad_w.reshape(orig_shape[0], -1)
 
         try:
-            nat_grad_w = apply_vered(grad_w, R_X_w, R_G)
+            nat_grad_w = apply_ifkfac(grad_w, R_X_w, R_G)
         except Exception as e:
             logger.warning(
-                "IFKFAC: apply_vered failed for %s (%s) — using raw gradient.",
+                "IFKFAC: apply_ifkfac failed for %s (%s) — using raw gradient.",
                 type(module).__name__, e,
             )
             nat_grad_w = grad_w
@@ -520,7 +520,7 @@ class IFKFAC(torch.optim.Optimizer):
         # Matches ClassicKFAC: apply only the G factor (treat A=1 for bias).
         # nat_grad_b = G⁻¹ · grad_b = (R_Gᵀ R_G)⁻¹ · grad_b
         if module.bias is not None and module.bias.grad is not None:
-            nat_grad_b = apply_vered_bias(module.bias.grad, R_G)
+            nat_grad_b = apply_ifkfac_bias(module.bias.grad, R_G)
             if weight_decay > 0:
                 module.bias.data.mul_(1.0 - lr * weight_decay)
             module.bias.data.add_(nat_grad_b, alpha=-lr)
@@ -574,7 +574,7 @@ class IFKFAC(torch.optim.Optimizer):
                      self._step_count, len(self._factors))
 
         # Apply preconditioner and update weights.  Phase 2: layers are
-        # bucketed by (n_in, n_out) shape and apply_vered_batched runs once
+        # bucketed by (n_in, n_out) shape and apply_ifkfac_batched runs once
         # per bucket (4 batched trsm calls instead of 4 per layer).
         t_precond = time.perf_counter()
         self._apply_preconditioner_bucketed()

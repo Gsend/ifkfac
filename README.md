@@ -89,9 +89,9 @@ for x, y in loader:
 ### bf16
 
 Keep the model in fp32 and set `use_true_bf16=True`. IFKFAC then stores `R_X`
-and `R_G` as bfloat16 and routes QR / triangular solves through the hand-rolled
-bf16 primitives in `ifkfac.bf16_linalg` (cuSOLVER lacks bf16 `geqrf` /
-`triangular_solve` / `cholesky`). This is the regime where IFKFAC's `O(κ · ε)`
+and `R_G` as bfloat16 between refreshes and upcasts them (losslessly) to fp32
+for the four triangular solves, since cuSOLVER has no bf16 triangular solve or
+QR. Storage is bf16; the solves run in fp32. This is the regime where IFKFAC's `O(κ · ε)`
 stability matters — Classic K-FAC's `O(κ² · ε)` error saturates here.
 
 ```python
@@ -139,7 +139,7 @@ optimizer = IFKFAC(
 )
 ```
 
-### 2. For Bayesian deep learning (K-FAC Laplace, §5.8 of the paper)
+### 2. For Bayesian deep learning (K-FAC Laplace, §5.9 of the paper)
 
 ```python
 from ifkfac import IFKFAC, LaplacePosterior
@@ -197,7 +197,7 @@ IFKFAC uses streaming TSQR to compute `R` factors such that `RᵀR = A`,
 triangular solves with `R`. Total error: `O(κ(X) · ε)` — one order of κ
 better, structurally.
 
-See `paper.md` (or the paper) for the full theoretical analysis (Higham 2002,
+See `paper.pdf` for the full theoretical analysis (Higham 2002,
 Theorems 19.10 and 20.3).
 
 ## Tests
@@ -275,6 +275,45 @@ Actions workflow can publish on tagged releases without storing secrets.
 a version tag (e.g. `v0.1.0`), runs `python -m build` and `pypi-publish` via
 OIDC Trusted Publishing. Bump `version` in `pyproject.toml` for every release —
 PyPI refuses to overwrite an already-published version.
+
+## Reproducing the paper
+
+`paper.pdf` is the submitted paper. The `benchmark/` and `optimizer/`
+directories hold the exact research code behind every number in it;
+`ifkfac/` is the cleaned-up library. In the research code the method is the
+`IFKFAC` class in `optimizer/ifkfac_kfac.py`. Per-run results (one JSON per
+run, with per-step traces) are checked in under `benchmark/results/`. Every
+script skips runs whose JSON already exists, so delete a file to recompute it.
+
+Setup: install PyTorch and torchvision for your CUDA version, then
+`pip install -r requirements-paper.txt`. WikiText-2, CIFAR-10 and MNIST are
+downloaded on first use. All commands run from the repository root.
+
+| Paper | Command | Results in `benchmark/results/` |
+|---|---|---|
+| §4.5, Fig. 1 (synthetic κ sweep) | `python tests/test_kappa_scaling.py` (`--replot` redraws the figure from the JSON) | `kappa_scaling.json` |
+| §5.2 main result, §5.3 seed variance (SmallGPT small/medium, 5 seeds) | `python benchmark/kfac_bf16_multiseed.py` | `per_step_bf16_{small,medium}_{classic,ifkfac,singd}_seed*_s1000.json` |
+| AdamW rows at bf16 | `python benchmark/adamw_baseline_multiseed.py` | `per_step_bf16_{small,medium}_adamw_seed*_s1000.json` |
+| §5.4 fp32 sanity check | `python -m benchmark.rerun_suspicious --part fp32` | `per_step_fp32_small_*_champion_s1000.json` |
+| §5.5 damping sensitivity, Fig. 2 | `python -m benchmark.damping_sweep_multiseed`, then `python benchmark/plot_damping_sweep.py` | `per_step_bf16_*_damp_d*_seed*_s1000.json` |
+| §5.5 fp32 control for Fig. 2 | `python -m benchmark.damping_sweep_fp32` (add `--low` for λ = 1e-5, 3e-5), then `python benchmark/plot_damping_sweep.py` | `per_step_fp32_*_damp_d*_seed*_s1000.json` |
+| §5.7 side-optimizer check (embedding / head lr) | `python -m benchmark.kfac_side_lr_sweep`, then `--confirm` | `kfac_sidelr_*.json`, `adamw_ref_*.json` |
+| §5.6 wall time (Classic, IFKFAC streaming TSQR, SINGD rows) | `wall_s` field of the §5.2 JSONs | as §5.2 |
+| §5.7 transformer + CNN comparison, Figs. 3-4 | `python benchmark/comparison_4way_multiseed.py`, then `python benchmark/plot_4way_comparison.py` | `per_step_4way_*.json` |
+| §5.7 AdamW tuning | `python benchmark/adamw_tuning_sweep.py` | `adamw_tune_*.json` |
+| §5.7 matched tuning (SINGD screen, K-FAC weight decay) | `python benchmark/singd_tuning_sweep.py`; `python benchmark/kfac_wd_tuning_sweep.py` | `singd_tune2_*.json`, `kfac_wd_*.json` |
+| §5.7 ASDL reference check (ResNet-34 training) | `python benchmark/run_asdl_sweep.py --section 5.6` (the script's internal label for the ResNet-34 cells) | `per_step_4way_cnn_*_asdl_classic_seed*.json` |
+| §5.8 autoencoder screens | `python benchmark/autoencoder_mnist_screen.py` (and `_screen2`, `_screen3`, `_adamw_screen`, `_adamw_screen2`, `_adamw_bf16_screen`) | `ae_mnist_screen*_*.json`, `ae_mnist_adamw_*.json` |
+| §5.8 autoencoder multi-seed, Fig. 5 | `python benchmark/autoencoder_mnist.py`, then `python benchmark/plot_ae_walltime_loss.py` | `ae_mnist_{fp32,bf16}_*_seed*.json` |
+| §5.9 factor-level eigenvalue audit | `python -m benchmark.laplace_eig_audit`; ASDL probe: `python benchmark/probe_asdl_kappa.py --seed 42` | `laplace_eig_audit_seed*.json` |
+| §5.9 Table (exact-Fisher comparison, small MLP) | `python -m benchmark.fisher_approx_small --data mnist` and `--data digits` | `fisher_approx_small_*.json` |
+| Appendix A (ResNet-18 Laplace predictive) | `python -m benchmark.laplace_ekfac_2x2 --grid --smoke` | `laplace_cifar10_*_ps.json` |
+| §5.2 / §5.7 IFKFAC bf16 with R stored in bf16 | `python -m benchmark.rerun_ifkfac_true_bf16` (`--damping` adds the §5.5 curve) | `per_step_bf16tb_*.json`, `per_step_4way_*_bf16tb_*.json` |
+
+All pending runs in one command (resumable; `--hours N` sets a time budget): `python -m benchmark.run_overnight`.
+
+Hardware used for the paper: one NVIDIA RTX 3080 Laptop GPU (16 GB),
+PyTorch 2.11, CUDA 12.8. Every experiment fits in 16 GB.
 
 ## Citation
 

@@ -17,7 +17,7 @@ Three levels of implementation:
    Folds one new chunk into an existing partial R.  Used inside hooks
    so raw activations are discarded immediately — memory stays O(n²).
 
-apply_vered() — Back-substitution preconditioner apply.
+apply_ifkfac() — Back-substitution preconditioner apply.
    Given R_X (n_in × n_in) and R_G (n_out × n_out) from QR of X and δ,
    computes the natural gradient without ever forming A⁻¹ or G⁻¹:
 
@@ -464,12 +464,12 @@ def finalize_R(
 # ---------------------------------------------------------------------------
 
 
-def _apply_vered_batched_impl(
+def _apply_ifkfac_batched_impl(
     grad_W: torch.Tensor,
     R_X: torch.Tensor,
     R_G: torch.Tensor,
 ) -> torch.Tensor:
-    """Pure implementation — see ``apply_vered_batched`` for docs."""
+    """Pure implementation — see ``apply_ifkfac_batched`` for docs."""
 
     # ---- Left: multiply by G⁻¹ = (R_Gᵀ R_G)⁻¹ ----
     # Step 1: R_Gᵀ T1 = grad_W   (lower triangular system per batch element)
@@ -523,7 +523,7 @@ def _get_graphed_batched_apply(grad_W: torch.Tensor,
         sample_RG = torch.eye(n_out, dtype=grad_W.dtype, device=grad_W.device
                                ).unsqueeze(0).expand(B, n_out, n_out).contiguous()
         graphed = torch.cuda.make_graphed_callables(
-            _apply_vered_batched_impl,
+            _apply_ifkfac_batched_impl,
             (sample_grad, sample_RX, sample_RG),
         )
         _BATCHED_GRAPH_CACHE[key] = graphed
@@ -540,17 +540,17 @@ def _get_graphed_batched_apply(grad_W: torch.Tensor,
         return None
 
 
-def apply_vered_batched(
+def apply_ifkfac_batched(
     grad_W: torch.Tensor,
     R_X: torch.Tensor,
     R_G: torch.Tensor,
 ) -> torch.Tensor:
-    """Batched apply_vered: 4 cuSOLVER trsm launches total for B layers.
+    """Batched apply_ifkfac: 4 cuSOLVER trsm launches total for B layers.
 
-    Equivalent to running apply_vered separately for each (grad_W[i], R_X[i],
+    Equivalent to running apply_ifkfac separately for each (grad_W[i], R_X[i],
     R_G[i]) but uses batched triangular solves to amortise launch overhead.
 
-    On SmallGPT with 24 Linear K-FAC layers, the per-layer apply_vered does
+    On SmallGPT with 24 Linear K-FAC layers, the per-layer apply_ifkfac does
     4 × 24 = 96 trsm calls per step.  Bucketed by shape (mostly the d_model
     bucket) we drop this to ~12 batched calls — 8x fewer launches.
 
@@ -569,25 +569,25 @@ def apply_vered_batched(
         f"batch dims mismatch: grad_W={grad_W.shape[0]}, R_X={R_X.shape[0]}, R_G={R_G.shape[0]}"
 
     # Low-precision dispatch.  Loop over the bucket and route through
-    # apply_vered, which uses fp32 cuSOLVER internally for bf16-stored R and
+    # apply_ifkfac, which uses fp32 cuSOLVER internally for bf16-stored R and
     # reconciles a low-precision grad_W against fp32 R accumulators.  The
     # CUDA-graph fast path is fp32-only and skipped here.
     if (grad_W.dtype in _LOW_PRECISION
             or grad_W.dtype != R_X.dtype or grad_W.dtype != R_G.dtype):
-        return torch.stack([apply_vered(grad_W[i], R_X[i], R_G[i])
+        return torch.stack([apply_ifkfac(grad_W[i], R_X[i], R_G[i])
                               for i in range(B)], dim=0)
 
     graphed = _get_graphed_batched_apply(grad_W, R_X, R_G)
     if graphed is None:
-        return _apply_vered_batched_impl(grad_W, R_X, R_G)
+        return _apply_ifkfac_batched_impl(grad_W, R_X, R_G)
     return graphed(grad_W, R_X, R_G)
 
 
 # ---------------------------------------------------------------------------
-# 4. apply_vered — back-substitution preconditioner
+# 4. apply_ifkfac — back-substitution preconditioner
 # ---------------------------------------------------------------------------
 
-def apply_vered(
+def apply_ifkfac(
     grad_W: torch.Tensor,
     R_X: torch.Tensor,
     R_G: torch.Tensor,
@@ -630,7 +630,7 @@ def apply_vered(
     inversion and the κ(X)⁴ condition number amplification.
     """
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("apply_vered() called: %s  %s  %s",
+        logger.debug("apply_ifkfac() called: %s  %s  %s",
                      _TS(grad_W, "grad_W"), _TS(R_X, "R_X"), _TS(R_G, "R_G"))
 
     # ---- Bf16-storage dispatch ----
@@ -645,12 +645,12 @@ def apply_vered(
     # for full-rank QR), fall back to the raw gradient for that layer.
     if R_X.dtype == torch.bfloat16 or R_G.dtype == torch.bfloat16:
         if R_X.shape[0] != R_X.shape[1]:
-            print(f"[apply_vered bf16] SKIP — R_X non-square: "
+            print(f"[apply_ifkfac bf16] SKIP — R_X non-square: "
                   f"shape={tuple(R_X.shape)}.  Returning raw gradient.",
                   flush=True)
             return grad_W
         if R_G.shape[0] != R_G.shape[1]:
-            print(f"[apply_vered bf16] SKIP — R_G non-square: "
+            print(f"[apply_ifkfac bf16] SKIP — R_G non-square: "
                   f"shape={tuple(R_G.shape)}.  Returning raw gradient.",
                   flush=True)
             return grad_W
@@ -684,11 +684,11 @@ def apply_vered(
     # Step 1: solve R_Gᵀ T1 = grad_W   (lower triangular)
     T1 = torch.linalg.solve_triangular(R_G.T, grad_W, upper=False)   # (n_out, n_in)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("apply_vered() T1 = R_G⁻ᵀ · grad_W: %s", _TS(T1, "T1"))
+        logger.debug("apply_ifkfac() T1 = R_G⁻ᵀ · grad_W: %s", _TS(T1, "T1"))
     # Step 2: solve R_G T2 = T1         (upper triangular)
     T2 = torch.linalg.solve_triangular(R_G, T1, upper=True)          # (n_out, n_in)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("apply_vered() T2 = G⁻¹ · grad_W: %s", _TS(T2, "T2"))
+        logger.debug("apply_ifkfac() T2 = G⁻¹ · grad_W: %s", _TS(T2, "T2"))
 
     # ---- Right: multiply by A⁻¹ = (R_Xᵀ R_X)⁻¹ ----
     # T2 · A⁻¹ = T2 · R_X⁻¹ · R_Xᵀ⁻¹
@@ -697,19 +697,19 @@ def apply_vered(
     # Step 3: solve R_Xᵀ T3ᵀ = T2ᵀ   (lower triangular)
     T3_T = torch.linalg.solve_triangular(R_X.T, T2.T, upper=False)   # (n_in, n_out)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("apply_vered() T3ᵀ = R_X⁻ᵀ · T2ᵀ: %s", _TS(T3_T, "T3_T"))
+        logger.debug("apply_ifkfac() T3ᵀ = R_X⁻ᵀ · T2ᵀ: %s", _TS(T3_T, "T3_T"))
     # Step 4: solve R_X T4ᵀ = T3ᵀ     (upper triangular)
     T4_T = torch.linalg.solve_triangular(R_X, T3_T, upper=True)      # (n_in, n_out)
 
     nat_grad = T4_T.T                                                  # (n_out, n_in)
     if logger.isEnabledFor(logging.DEBUG):
         scale = (nat_grad.norm() / (grad_W.norm() + 1e-12)).item()
-        logger.debug("apply_vered() done: %s  scale_vs_grad=%.4g×",
+        logger.debug("apply_ifkfac() done: %s  scale_vs_grad=%.4g×",
                      _TS(nat_grad, "nat_grad"), scale)
     return nat_grad.to(out_dtype)
 
 
-def apply_vered_bias(
+def apply_ifkfac_bias(
     grad_b: torch.Tensor,
     R_G: torch.Tensor,
 ) -> torch.Tensor:
@@ -730,7 +730,7 @@ def apply_vered_bias(
     nat_grad_b : (n_out,)
     """
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("apply_vered_bias() called: %s  %s",
+        logger.debug("apply_ifkfac_bias() called: %s  %s",
                      _TS(grad_b, "grad_b"), _TS(R_G, "R_G"))
     # bf16-storage dispatch — cast R to fp32 (lossless from bf16) and run
     # cuSOLVER triangular_solve.  Matches the bf16-storage / fp32-accumulate
@@ -738,7 +738,7 @@ def apply_vered_bias(
     # the raw gradient (equivalent to SGD for this layer this round).
     if R_G.dtype == torch.bfloat16:
         if R_G.shape[0] != R_G.shape[1]:
-            print(f"[apply_vered_bias bf16] SKIP — R_G non-square: "
+            print(f"[apply_ifkfac_bias bf16] SKIP — R_G non-square: "
                   f"shape={tuple(R_G.shape)}.  Returning raw bias gradient.",
                   flush=True)
             return grad_b
@@ -750,7 +750,7 @@ def apply_vered_bias(
         return T2.squeeze(1).to(grad_dtype)
 
     gb = grad_b.unsqueeze(1)                                           # (n_out, 1)
-    # Dtype alignment — see the matching note in apply_vered.
+    # Dtype alignment — see the matching note in apply_ifkfac.
     out_dtype = grad_b.dtype
     solve_dtype = torch.promote_types(R_G.dtype, grad_b.dtype)
     if solve_dtype in _LOW_PRECISION:
@@ -762,5 +762,5 @@ def apply_vered_bias(
     T2 = torch.linalg.solve_triangular(R_G, T1, upper=True)           # (n_out, 1)
     result = T2.squeeze(1).to(out_dtype)                               # (n_out,)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("apply_vered_bias() done: %s", _TS(result, "nat_grad_b"))
+        logger.debug("apply_ifkfac_bias() done: %s", _TS(result, "nat_grad_b"))
     return result
