@@ -53,6 +53,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from optimizer.gram_estimator import GramMatrixEstimator
+from optimizer.dtype_check import expect
 
 # PyTorch emits this UserWarning every backward pass for layers whose *input*
 # doesn't require grad (e.g. the first layer, which receives raw data).
@@ -114,6 +115,15 @@ class KFACHooks(GramMatrixEstimator):
         self._n_A: Dict[nn.Module, int] = {}
         self._n_G: Dict[nn.Module, int] = {}
 
+        # dtype the K-FAC pipeline computes in.  None: keep the captured
+        # tensors' dtype.  torch.bfloat16: activations and output gradients are
+        # cast to bf16 on capture, so every later K-FAC stage runs in bf16 even
+        # when the model itself runs in mixed precision (fp32 master weights).
+        self.compute_dtype = None
+        # dtype the model itself must hand over (a bf16 model: activations and
+        # output gradients must already be bf16, so no cast can hide an upcast
+        # upstream).  Both are verified by optimizer.dtype_check on every call.
+        self.require_input_dtype = None
         self._enabled = False
         self._linear_layers: List[nn.Module] = []   # nn.Linear + nn.Conv2d
 
@@ -202,7 +212,13 @@ class KFACHooks(GramMatrixEstimator):
         """
         if not self._enabled:
             return
-        x = input[0].detach()
+        x = input[0]
+        if self.require_input_dtype is not None:
+            expect("classic.hook.activation_from_model", x, dtype=self.require_input_dtype)
+        if self.compute_dtype is not None and x.dtype != self.compute_dtype:
+            with torch.no_grad():
+                x = x.to(self.compute_dtype)
+        x = x.detach()
         if isinstance(module, nn.Conv2d):
             x = self._unfold_conv_input(x, module)   # (B·L, C_in·kH·kW)
         elif x.ndim > 2:
@@ -218,6 +234,9 @@ class KFACHooks(GramMatrixEstimator):
         else:
             self._A_sum[module] = gram_a
             self._n_A[module] = x.shape[0]
+        if self.compute_dtype is not None:
+            expect("classic.hook.activations", x, dtype=self.compute_dtype)
+            expect("classic.hook.gram_A", gram_a, self._A_sum[module], dtype=self.compute_dtype)
 
     def _backward_hook(
         self,
@@ -234,7 +253,13 @@ class KFACHooks(GramMatrixEstimator):
         """
         if not self._enabled:
             return
-        delta = grad_output[0].detach()
+        delta = grad_output[0]
+        if self.require_input_dtype is not None:
+            expect("classic.hook.output_grad_from_model", delta, dtype=self.require_input_dtype)
+        if self.compute_dtype is not None and delta.dtype != self.compute_dtype:
+            with torch.no_grad():
+                delta = delta.to(self.compute_dtype)
+        delta = delta.detach()
         if isinstance(module, nn.Conv2d):
             delta = self._reshape_conv_grad(delta)    # (B·L, C_out)
         elif delta.ndim > 2:
@@ -250,6 +275,9 @@ class KFACHooks(GramMatrixEstimator):
         else:
             self._G_sum[module] = gram_g
             self._n_G[module] = delta.shape[0]
+        if self.compute_dtype is not None:
+            expect("classic.hook.output_grads", delta, dtype=self.compute_dtype)
+            expect("classic.hook.gram_G", gram_g, self._G_sum[module], dtype=self.compute_dtype)
 
     def get_factors(self) -> Dict[nn.Module, Tuple[torch.Tensor, torch.Tensor]]:
         """Return averaged Gram matrices (A, G) for each tracked layer.
@@ -266,6 +294,8 @@ class KFACHooks(GramMatrixEstimator):
                 continue
             A = self._A_sum[module] / self._n_A[module]
             G = self._G_sum[module] / self._n_G[module]
+            if self.compute_dtype is not None:
+                expect("classic.factors_window_avg", A, G, dtype=self.compute_dtype)
             factors[module] = (A, G)
         return factors
 

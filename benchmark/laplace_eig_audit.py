@@ -23,6 +23,8 @@ vary slightly across runs.
 Run:
     python -m benchmark.laplace_eig_audit                 # seeds 42 43 44, ~15 min (RTX 3080 Laptop)
     python -m benchmark.laplace_eig_audit --seeds 42 --no-asdl
+Resumable: a seed whose file already has both captures is skipped; a file with
+only the homebrew capture gets the ASDL capture added.
 Output: benchmark/results/laplace_eig_audit_seed{seed}.json
 """
 from __future__ import annotations
@@ -113,7 +115,11 @@ def capture_homebrew(model, loader, device):
 
 
 def capture_asdl(model, loader, device):
-    """probe_asdl_kappa.py's capture: ASDL accumulate_curvature, read kron.A / kron.B."""
+    """probe_asdl_kappa.py's capture: ASDL accumulate_curvature, read kron.A / kron.B.
+
+    `model` must be a freshly loaded network: PyTorch keeps a per-module flag
+    once a full backward hook has been registered (even after the handle is
+    removed), and then refuses ASDL's regular backward hooks on that module."""
     from optimizer.asdl_classic_kfac import AsdlClassicKFAC
     opt = AsdlClassicKFAC(
         model, lr=L.KFAC_LR, damping=L.KFAC_DAMPING_TRAIN,
@@ -162,25 +168,39 @@ def main():
 
     for seed in args.seeds:
         print(f"\n=== seed {seed} ===", flush=True)
-        model, _ = L.train_or_load_map(seed, train, device)
-        rec = {"seed": seed, "device": str(device), "torch": torch.__version__,
-               "protocol": "fp32 capture; bf16 = bf16 storage of the fp32 Gram, fp32 eigh"}
+        p = OUT / f"laplace_eig_audit_seed{seed}.json"
+        rec = json.loads(p.read_text()) if p.exists() else {}
+        have_home = "summary" in rec.get("homebrew_classic", {})
+        have_asdl = "summary" in rec.get("asdl_classic", {})
+        if have_home and (have_asdl or args.no_asdl):
+            print(f"  already done ({p.name}), skipping", flush=True)
+            continue
+        rec.update({"seed": seed, "device": str(device), "torch": torch.__version__,
+                    "protocol": "fp32 capture; bf16 = bf16 storage of the fp32 Gram, fp32 eigh"})
 
-        t0 = time.perf_counter()
-        rows = capture_homebrew(model, train_loader(train, seed), device)
-        rec["homebrew_classic"] = {"summary": summarize(rows, "A"), "per_layer": rows,
-                                   "wall_s": time.perf_counter() - t0}
-        s = rec["homebrew_classic"]["summary"]
-        print(f"  homebrew Classic ({s['n_layers']} layers): neg A/G fp32 = "
-              f"{s['fp32']['n_neg_A']}/{s['fp32']['n_neg_G']}   bf16 = "
-              f"{s['bf16']['n_neg_A']}/{s['bf16']['n_neg_G']}   "
-              f"d_A in [{s['fp32']['d_A_min']:.3g}, {s['fp32']['d_A_max']:.3g}]   "
-              f"median kappa(A) fp32 = {s['fp32']['median_kappa_A']:.3g}", flush=True)
+        if have_home:
+            print("  homebrew Classic: already in the result file", flush=True)
+        else:
+            model, _ = L.train_or_load_map(seed, train, device)
+            t0 = time.perf_counter()
+            rows = capture_homebrew(model, train_loader(train, seed), device)
+            rec["homebrew_classic"] = {"summary": summarize(rows, "A"), "per_layer": rows,
+                                       "wall_s": time.perf_counter() - t0}
+            s = rec["homebrew_classic"]["summary"]
+            print(f"  homebrew Classic ({s['n_layers']} layers): neg A/G fp32 = "
+                  f"{s['fp32']['n_neg_A']}/{s['fp32']['n_neg_G']}   bf16 = "
+                  f"{s['bf16']['n_neg_A']}/{s['bf16']['n_neg_G']}   "
+                  f"d_A in [{s['fp32']['d_A_min']:.3g}, {s['fp32']['d_A_max']:.3g}]   "
+                  f"median kappa(A) fp32 = {s['fp32']['median_kappa_A']:.3g}", flush=True)
+            p.write_text(json.dumps(rec, indent=2))
+            model = None
 
         if not args.no_asdl:
             t0 = time.perf_counter()
             try:
+                model, _ = L.train_or_load_map(seed, train, device)   # fresh copy, no hook history
                 rows = capture_asdl(model, train_loader(train, seed), device)
+                model = None
                 rec["asdl_classic"] = {"summary": summarize(rows, "A"), "per_layer": rows,
                                        "wall_s": time.perf_counter() - t0}
                 s = rec["asdl_classic"]["summary"]
@@ -193,10 +213,9 @@ def main():
                 rec["asdl_classic"] = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
                 print(f"  ASDL skipped: {rec['asdl_classic']['error']}", flush=True)
 
-        p = OUT / f"laplace_eig_audit_seed{seed}.json"
         p.write_text(json.dumps(rec, indent=2))
         print(f"  saved {p.name}", flush=True)
-        del model
+        model = None
         if device.type == "cuda":
             torch.cuda.empty_cache()
 

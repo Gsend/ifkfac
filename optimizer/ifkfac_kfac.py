@@ -70,6 +70,7 @@ import torch
 import torch.nn as nn
 
 from optimizer.raw_activation_hooks import RawActivationHooks, IFKFACRankError
+from optimizer.dtype_check import expect, expect_all
 from optimizer.sgso import apply_ifkfac, apply_ifkfac_bias, apply_ifkfac_batched
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,8 @@ class IFKFAC(torch.optim.Optimizer):
         batched_qr: bool = False,
         deferred_qr: bool = False,
         use_true_bf16: bool = False,
+        pure_bf16: Optional[bool] = None,
+        kfac_dtype: Optional[torch.dtype] = None,
     ):
         logger.debug(
             "IFKFAC init: factor_update_freq=%d  damping=%.2e  augment_bias=%s  batched_qr=%s  deferred_qr=%s  true_bf16=%s",
@@ -161,7 +164,32 @@ class IFKFAC(torch.optim.Optimizer):
         self.gamma = gamma
         self.augment_bias = augment_bias
 
-        # Hooks — streaming TSQR accumulation of R factors
+        # Pure-bf16 mode: the model itself is bf16 (weights, activations,
+        # gradients), and every stage here keeps bf16 - hooks buffer bf16
+        # chunks, the QRs / ridge / moving-average blend run in the bf16
+        # Householder kernel, the solves in the bf16 blocked triangular
+        # solver, momentum and the weight update in bf16.  Detected from the
+        # layer weights' dtype unless forced.
+        w_dtypes = {m.weight.dtype for m in model.modules()
+                    if isinstance(m, (nn.Linear, nn.Conv2d))}
+        # kfac_dtype=torch.bfloat16 selects the same bf16 pipeline for a
+        # mixed-precision model (fp32 master weights, bf16 autocast compute):
+        # captured activations / output gradients and the weight gradient are
+        # cast to bf16 on entry, everything K-FAC computes is bf16, and only
+        # the final add into the fp32 master weight happens in fp32.
+        if kfac_dtype is not None and kfac_dtype != torch.bfloat16:
+            raise ValueError("kfac_dtype must be None or torch.bfloat16")
+        if pure_bf16 is None:
+            pure_bf16 = (w_dtypes == {torch.bfloat16}) or kfac_dtype == torch.bfloat16
+        if pure_bf16 and w_dtypes != {torch.bfloat16} and kfac_dtype != torch.bfloat16:
+            raise ValueError(f"pure_bf16=True needs a bf16 model or kfac_dtype=bf16, got {w_dtypes}")
+        self.pure_bf16 = bool(pure_bf16)       # True = bf16 K-FAC pipeline
+        self._pure_buckets: Dict = {}
+        self.pure_stats = {"refreshes": 0, "skipped_partial_rank": 0}
+
+        # Hooks — streaming TSQR accumulation of R factors.  In pure-bf16
+        # mode the hooks only buffer the bf16 chunks of each refresh window;
+        # the QRs run once per window, batched over layers of equal width.
         self.hooks = RawActivationHooks(
             model,
             damping=damping,
@@ -169,9 +197,17 @@ class IFKFAC(torch.optim.Optimizer):
             augment_bias=augment_bias,
             max_conv_rows=max_conv_rows,
             max_seq_rows=max_seq_rows,
-            batched=batched_qr,
-            deferred=deferred_qr,
+            batched=(batched_qr and not self.pure_bf16),
+            deferred=(deferred_qr or self.pure_bf16),
+            deferred_window=(10 ** 9 if self.pure_bf16 else 5),
         )
+        if self.pure_bf16:
+            self.hooks.compute_dtype = torch.bfloat16
+        # a bf16 model must hand over bf16 activations, output gradients and
+        # weight gradients (checked on every call, optimizer/dtype_check.py)
+        self._model_bf16 = (w_dtypes == {torch.bfloat16})
+        if self._model_bf16:
+            self.hooks.require_input_dtype = torch.bfloat16
         self.hooks.enable()
 
         # Cached R factors: module → (R_X, R_G)
@@ -199,8 +235,189 @@ class IFKFAC(torch.optim.Optimizer):
     # Factor update
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pure-bf16 path
+    # ------------------------------------------------------------------
+
+    PURE_QR_BUDGET = 1 << 28      # max elements (512 MB of bf16) per batched QR
+
+    @classmethod
+    def _bucket_qr(cls, mats):
+        """R factors of a list of bf16 matrices (m_i, n_i): batched bf16
+        Householder QRs, one per distinct n (rows zero-padded to the bucket
+        max, which leaves R unchanged), split so that no batch exceeds
+        PURE_QR_BUDGET elements.  Consumes the list: each input is released
+        once copied into its batch, and the batch is factored in place."""
+        from optimizer.bf16_linalg import qr_r_bf16
+        out = [None] * len(mats)
+        by_n: Dict[int, list] = {}
+        for i, M in enumerate(mats):
+            by_n.setdefault(M.shape[1], []).append(i)
+        for n, idx in by_n.items():
+            m_max = max(mats[i].shape[0] for i in idx)
+            per = max(1, cls.PURE_QR_BUDGET // (m_max * n))
+            for s in range(0, len(idx), per):
+                sub = idx[s:s + per]
+                stack = torch.zeros(len(sub), m_max, n, dtype=mats[sub[0]].dtype,
+                                    device=mats[sub[0]].device)
+                for k, i in enumerate(sub):
+                    stack[k, :mats[i].shape[0]] = mats[i]
+                    mats[i] = None
+                R = qr_r_bf16(stack, overwrite=True)
+                for k, i in enumerate(sub):
+                    out[i] = R[k].clone()
+                del stack, R
+        return out
+
+    def _update_factors_pure(self):
+        """Refresh: window QR -> scale 1/sqrt(rows) -> ridge [R; sqrt(lam) I]
+        -> moving-average blend [sqrt(g) R_old; sqrt(1-g) R_new], all bf16."""
+        import math
+        t0 = time.perf_counter()
+        h = self.hooks
+        mods, mats, rows = [], [], []
+        for m in h.linear_layers:
+            cx, cg = h._raw_X.get(m, []), h._raw_G.get(m, [])
+            if not cx or not cg:
+                continue
+            X = cx[0] if len(cx) == 1 else torch.cat(cx, dim=0)
+            G = cg[0] if len(cg) == 1 else torch.cat(cg, dim=0)
+            expect("ifkfac.window_rows", X, G)
+            if X.shape[0] < X.shape[1] or G.shape[0] < G.shape[1]:
+                self.pure_stats["skipped_partial_rank"] += 1
+                continue
+            mods.append(m); mats += [X, G]; rows += [X.shape[0], G.shape[0]]
+        h.clear()
+        if not mods:
+            self.timing["factor_compute"].append(time.perf_counter() - t0)
+            return
+        expect_all("ifkfac.window_rows_full_rank", mats)   # the windows that go into the QR
+        R = self._bucket_qr(mats)          # consumes mats
+        del mats
+        expect_all("ifkfac.R_window", R)
+        R = [r / math.sqrt(p) for r, p in zip(R, rows)]
+        sl = math.sqrt(self.damping)
+        R = self._bucket_qr([torch.cat([r, sl * torch.eye(r.shape[0], dtype=r.dtype, device=r.device)], 0)
+                             for r in R])
+        expect_all("ifkfac.R_damped", R)
+        new = {m: (R[2 * i], R[2 * i + 1]) for i, m in enumerate(mods)}
+        if self.gamma > 0.0:
+            sg, s1g = math.sqrt(self.gamma), math.sqrt(1.0 - self.gamma)
+            keys = [(m, j) for m in mods if m in self._factors for j in (0, 1)]
+            if keys:
+                B = self._bucket_qr([torch.cat([sg * self._factors[m][j], s1g * new[m][j]], 0)
+                                     for m, j in keys])
+                expect_all("ifkfac.R_blended", B)
+                for (m, j), r in zip(keys, B):
+                    pair = list(new[m]); pair[j] = r; new[m] = tuple(pair)
+        expect_all("ifkfac.factors", [r for p in new.values() for r in p])
+        self._factors.update(new)
+        self._build_pure_buckets()
+        self.pure_stats["refreshes"] += 1
+        self.pure_stats["factor_dtypes"] = sorted({str(r.dtype) for p in new.values() for r in p})
+        self.timing["factor_compute"].append(time.perf_counter() - t0)
+
+    def _build_pure_buckets(self):
+        """Group layers by (n_in, n_out); stack their R's once per refresh and
+        precompute the blocked triangular solvers (inverted diagonal blocks)."""
+        from optimizer.bf16_linalg import TriSolver
+        groups: Dict = {}
+        for m in self.hooks.linear_layers:
+            if m not in self._factors:
+                continue
+            R_X, R_G = self._factors[m]
+            groups.setdefault((R_X.shape[0], R_G.shape[0]), []).append(m)
+        self._pure_buckets = {}
+        for key, ms in groups.items():
+            RX = torch.stack([self._factors[m][0] for m in ms])
+            RG = torch.stack([self._factors[m][1] for m in ms])
+            SX, SG = TriSolver(RX), TriSolver(RG)
+            expect_all("ifkfac.solver_blocks", [SX.U, SG.U] + SX.Dinv + SG.Dinv)
+            self._pure_buckets[key] = (ms, SX, SG)
+
+    def _natural_gradients_pure(self):
+        """bf16 natural gradient G^-1 g A^-1 of every factored layer (bucketed
+        bf16 solves); the gradients are cast to bf16 on entry.  Returns
+        [(module, nat_weight_bf16, nat_bias_bf16 or None)]."""
+        out = []
+        for (n_in, n_out), (ms, SX, SG) in self._pure_buckets.items():
+            live = [m for m in ms if m.weight.grad is not None]
+            if not live:
+                continue
+            if len(live) != len(ms):          # rare: rebuild a sub-bucket
+                from optimizer.bf16_linalg import TriSolver
+                SX = TriSolver(torch.stack([self._factors[m][0] for m in live]))
+                SG = TriSolver(torch.stack([self._factors[m][1] for m in live]))
+            if self._model_bf16:
+                expect_all("ifkfac.weight_grad_from_model", [m.weight.grad for m in live])
+            g = torch.stack([m.weight.grad.to(torch.bfloat16).reshape(n_out, n_in) for m in live])
+            expect("ifkfac.natgrad_input", g)
+            T2 = SG.solve(SG.solve_t(g))
+            nat = SX.solve(SX.solve_t(T2.transpose(1, 2).contiguous())).transpose(1, 2)
+            expect("ifkfac.natgrad_W", T2, nat)
+            has_b = [m.bias is not None and m.bias.grad is not None for m in live]
+            nat_b = None
+            if any(has_b):
+                gb = torch.stack([m.bias.grad.to(torch.bfloat16) if hb
+                                  else torch.zeros(n_out, dtype=g.dtype, device=g.device)
+                                  for m, hb in zip(live, has_b)]).unsqueeze(2)
+                if self._model_bf16:
+                    expect_all("ifkfac.bias_grad_from_model",
+                               [m.bias.grad for m, hb in zip(live, has_b) if hb])
+                expect("ifkfac.natgrad_input_bias", gb)
+                nat_b = SG.solve(SG.solve_t(gb)).squeeze(2)
+                expect("ifkfac.natgrad_b", nat_b)
+            for i, m in enumerate(live):
+                out.append((m, nat[i].reshape(m.weight.shape), nat_b[i] if has_b[i] else None))
+        return out
+
+    def _master_update(self, m, w, b):
+        """Clip, momentum, decoupled weight decay and update in the parameter
+        dtype: fp32 master weights under mixed precision (as SINGD and AMP
+        optimizers do), bf16 for a bf16 model."""
+        lr, wd, mom = self._get_module_hp(m)
+        if lr is None:
+            return
+        w = w.to(m.weight.dtype)
+        if self.grad_clip is not None:
+            gnorm = w.norm()
+            if gnorm > self.grad_clip:
+                w = w * (self.grad_clip / gnorm)
+        if mom > 0:
+            if m not in self._momentum_buffers:
+                self._momentum_buffers[m] = torch.zeros_like(w)
+            buf = self._momentum_buffers[m]
+            buf.mul_(mom).add_(w)
+            w = buf
+        if wd > 0:
+            m.weight.data.mul_(1.0 - lr * wd)
+        m.weight.data.add_(w, alpha=-lr)
+        if b is not None:
+            b = b.to(m.bias.dtype)
+            if wd > 0:
+                m.bias.data.mul_(1.0 - lr * wd)
+            m.bias.data.add_(b, alpha=-lr)
+
+    def _apply_pure(self):
+        """Per step: bf16 natural gradients for all factored layers, then the
+        update of the (master) weights; layers without factors yet get the
+        plain-SGD fallback of the fp32 path."""
+        done = set()
+        for m, w, b in self._natural_gradients_pure():
+            self._master_update(m, w, b)
+            done.add(m)
+        for m in self.hooks.linear_layers:
+            if m in done or m in self._factors or m.weight.grad is None:
+                continue
+            lr, wd, mom = self._get_module_hp(m)
+            if lr is None:
+                continue
+            self._sgd_fallback(m.weight, lr, wd)
+
     def _update_factors(self):
         """Refresh R factors from the hooks' streaming TSQR accumulators."""
+        if self.pure_bf16:
+            return self._update_factors_pure()
         t0 = time.perf_counter()
         logger.debug("IFKFAC._update_factors() called at step %d", self._step_count)
 
@@ -292,6 +509,7 @@ class IFKFAC(torch.optim.Optimizer):
         if self.use_true_bf16:
             clean = {m: (R_X.to(torch.bfloat16), R_G.to(torch.bfloat16))
                       for m, (R_X, R_G) in clean.items()}
+            expect_all("ifkfac.storage.R_stored", [r for p in clean.values() for r in p])
 
         self._factors = clean
         self.timing["factor_compute"].append(time.perf_counter() - t0)
@@ -322,6 +540,11 @@ class IFKFAC(torch.optim.Optimizer):
         batching win on the common case (transformer Linear with consistent
         shapes).
         """
+        if self.pure_bf16:
+            return self._apply_pure()
+        if self.use_true_bf16 and self._factors:
+            # bf16-storage runs: the R factors applied below must be the bf16-stored ones
+            expect_all("ifkfac.storage.R_applied", [r for p in self._factors.values() for r in p])
         # First pass: classify each module.  Per-layer fallback handles the
         # tricky cases; the fast path handles plain 2-D Linear.
         fast = {}   # (n_in, n_out, dtype, device) → list of (module, lr, wd, mom)
@@ -422,6 +645,13 @@ class IFKFAC(torch.optim.Optimizer):
                         m.bias.data.mul_(1.0 - lr * wd)
                     m.bias.data.add_(nat_grad_b, alpha=-lr)
 
+    @staticmethod
+    def _sgd_fallback(weight, lr, weight_decay):
+        """Plain SGD (decoupled wd) for a layer that has no factors yet."""
+        if weight_decay > 0:
+            weight.data.mul_(1.0 - lr * weight_decay)
+        weight.data.add_(weight.grad, alpha=-lr)
+
     def _apply_preconditioner(
         self,
         module: nn.Module,
@@ -442,9 +672,7 @@ class IFKFAC(torch.optim.Optimizer):
         # ---- Select R factors ----
         if module not in self._factors:
             # No preconditioner yet — plain SGD step with decoupled wd
-            if weight_decay > 0:
-                weight.data.mul_(1.0 - lr * weight_decay)
-            weight.data.add_(weight.grad, alpha=-lr)
+            self._sgd_fallback(weight, lr, weight_decay)
             return
 
         R_X, R_G = self._factors[module]

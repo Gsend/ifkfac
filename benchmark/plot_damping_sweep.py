@@ -5,8 +5,16 @@ Classic K-FAC vs IFKFAC only: same Tikhonov-ridge semantics.
 SINGD is excluded because its `damping` argument is a preconditioner-
 update scale, not a Tikhonov ridge.
 
-bf16 curves (solid):  per_step_bf16_{classic|ifkfac}_damp_d{d}_seed{s}_s1000.json
-                      (benchmark/damping_sweep_multiseed.py)
+bf16 curves (solid):  mixed precision with bf16 K-FAC when present -
+                        per_step_bf16amp_{classic|ifkfac}_damp_d{d}_seed{s}_s1000.json
+                        (benchmark/run_amp_bf16.py --only 5.5); else corrected reruns -
+                        Classic: per_step_bf16fix_classic_damp_d{d}_seed{s}_s1000.json
+                                 (benchmark/rerun_classic_bf16_fixed.py --only 5.5)
+                        IFKFAC:  per_step_bf16tb_ifkfac_damp_d{d}_seed{s}_s1000.json
+                                 (benchmark/rerun_ifkfac_true_bf16.py --only 5.5)
+                      otherwise the original per_step_bf16_{classic|ifkfac}_damp_...
+                      files (benchmark/damping_sweep_multiseed.py), labelled
+                      "old harness" in the legend.
 fp32 curves (dashed): per_step_fp32_{classic|ifkfac}_damp_d{d}_seed{s}_s1000.json
                       (benchmark/damping_sweep_fp32.py), drawn when present.
 Without fp32 sweep results, the single-seed fp32 Classic champion run
@@ -42,6 +50,17 @@ METHODS = {
 }
 
 
+BF16_PREFIXES = {"classic": ["bf16amp", "bf16fix", "bf16"], "ifkfac": ["bf16amp", "bf16tb", "bf16"]}
+
+
+def bf16_prefix(method):
+    """First bf16 result prefix with any file for this method (corrected reruns first)."""
+    for pre in BF16_PREFIXES[method]:
+        if any(RES.glob(f"per_step_{pre}_{method}_damp_d*_seed*_s1000.json")):
+            return pre
+    return BF16_PREFIXES[method][-1]
+
+
 def load_series(prec, method):
     """-> (lambdas, mean, std, n_seeds) over lambdas with at least one seed."""
     lam, mu, sd, n = [], [], [], []
@@ -70,20 +89,22 @@ def main():
     fig, ax = plt.subplots(figsize=(5.5, 3.6), dpi=300)
     all_y, all_x, have_fp32 = [], [], False
     for method, st in METHODS.items():
-        for prec, ls, fill in (("bf16", "-", st["color"]), ("fp32", "--", "white")):
+        for prec, ls, fill in ((bf16_prefix(method), "-", st["color"]), ("fp32", "--", "white")):
             lam, mu, sd, n = load_series(prec, method)
             if len(lam) == 0:
                 continue
             have_fp32 |= prec == "fp32"
+            is_bf16 = prec != "fp32"
             ax.fill_between(lam, mu - sd, mu + sd, color=st["color"],
-                            alpha=0.18 if prec == "bf16" else 0.10, linewidth=0, zorder=2)
+                            alpha=0.18 if is_bf16 else 0.10, linewidth=0, zorder=2)
             partial = "" if all(k == len(SEEDS) for k in n) else f", {min(n)}-{max(n)} seeds"
-            ax.plot(lam, mu, color=st["color"], linestyle=ls, linewidth=2.0 if prec == "bf16" else 1.6,
-                    marker=st["marker"], markersize=6 if prec == "bf16" else 5,
+            ax.plot(lam, mu, color=st["color"], linestyle=ls, linewidth=2.0 if is_bf16 else 1.6,
+                    marker=st["marker"], markersize=6 if is_bf16 else 5,
                     markerfacecolor=fill, markeredgecolor=st["color"], markeredgewidth=1.0,
-                    label=f"{st['label']}, {prec}{partial}", zorder=3)
+                    label=f"{st['label']}, {'fp32' if prec == 'fp32' else 'bf16'}{partial}"
+                          + (" (old harness)" if prec == "bf16" else ""), zorder=3)
             all_y += list(mu - sd) + list(mu + sd); all_x += list(lam)
-            if prec == "bf16":
+            if is_bf16:
                 i = int(np.argmin(mu))
                 dx, dy = (1.5, -160) if method == "classic" else (0.15, 140)
                 ax.annotate(f"min: {mu[i]:.0f}", xy=(lam[i], mu[i]),

@@ -2,8 +2,11 @@
 benchmark/plot_4way_comparison.py
 
 Two figures from the 4-way comparison sweep:
-  - Figure A (2×2 grid): training-loss curves for transformer + cnn, fp32 + bf16
+  - Figure A (2×2 grid): training-loss curves for transformer + cnn, fp32 and
+    mixed precision with bf16 K-FAC (results prefix bf16amp, run_amp_bf16.py)
   - Figure B (2×2 grid): wall-time bar charts (mean per method, with seed range)
+SINGD-Dense does not train on the ResNet (10% accuracy at both precisions) and
+is left out of the CNN panels.
 
 Output: benchmark/results/comparison_loss.png
         benchmark/results/comparison_wall.png
@@ -26,7 +29,8 @@ METHODS = [
 ]
 ARCHS = [("transformer", "SmallGPT-medium (22M)"),
          ("cnn",         "ResNet-34 CIFAR-10 (21M)")]
-PRECISIONS = ["fp32", "bf16"]
+PRECISIONS = ["fp32", "bf16amp"]
+PREC_TITLE = {"fp32": "fp32", "bf16amp": "mixed precision, bf16 K-FAC"}
 SEEDS = [42, 43, 44]
 # Per-step losses are logged every 10 training steps (101 records over 1000
 # steps), so a rolling window of 5 records ≈ 50 steps — enough to denoise
@@ -38,7 +42,16 @@ def load_run(arch, precision, method, seed):
     p = RES / f"per_step_4way_{arch}_{precision}_{method}_seed{seed}.json"
     if not p.exists():
         return None
-    return json.loads(p.read_text())
+    d = json.loads(p.read_text())
+    ps = d.get("per_step", [])
+    if len(ps) > 200:            # full per-step log: keep the fp32 runs' grid (steps 1, 11, ..., 991, last)
+        last = ps[-1]["step"]
+        d["per_step"] = [r for r in ps if (r["step"] - 1) % 10 == 0 or r["step"] == last]
+    return d
+
+
+def skip(arch, method):
+    return arch == "cnn" and method == "singd"
 
 
 def smooth(x, w):
@@ -57,6 +70,8 @@ def plot_loss():
         for pi, precision in enumerate(PRECISIONS):
             ax = axes[ai, pi]
             for method, label, color in METHODS:
+                if skip(arch, method):
+                    continue
                 curves, step_arrs = [], []
                 for s in SEEDS:
                     d = load_run(arch, precision, method, s)
@@ -88,7 +103,7 @@ def plot_loss():
                         label=f"{label} (n={len(curves)})")
                 ax.fill_between(xsteps, mean - std, mean + std,
                                 color=color, alpha=0.15)
-            ax.set_title(f"{arch_title} — {precision}", fontsize=10)
+            ax.set_title(f"{arch_title}, {PREC_TITLE[precision]}", fontsize=10)
             ax.grid(alpha=0.3)
             if ai == len(ARCHS) - 1:
                 ax.set_xlabel("training step")
@@ -96,10 +111,6 @@ def plot_loss():
                 ax.set_ylabel("loss (cross-entropy)")
             ax.legend(loc="upper right", fontsize=8)
             ax.set_xlim(0, 1000)
-    fig.suptitle(f"Training-loss curves: 4-way comparison "
-                 f"(mean ± std over {len(SEEDS)} seeds, "
-                 f"{SMOOTH}-step rolling smoothing)",
-                 fontsize=11, y=1.00)
     fig.tight_layout()
     out = RES / "comparison_loss.png"
     fig.savefig(str(out), dpi=140, bbox_inches="tight")
@@ -117,6 +128,8 @@ def plot_wall():
             ax = axes[ai, pi]
             labels, means, stds, colors, is_na = [], [], [], [], []
             for method, label, color in METHODS:
+                if skip(arch, method):
+                    continue
                 walls = []
                 for s in SEEDS:
                     d = load_run(arch, precision, method, s)
@@ -154,12 +167,10 @@ def plot_wall():
                     ax.text(xi, m, f"{m:.1f}m", ha="center", va="bottom",
                             fontsize=8)
             ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, fontsize=8)
-            ax.set_title(f"{arch_title} — {precision}", fontsize=10)
+            ax.set_title(f"{arch_title}, {PREC_TITLE[precision]}", fontsize=10)
             ax.grid(alpha=0.3, axis="y")
             if pi == 0:
                 ax.set_ylabel("wall time (min / 1000 steps)")
-    fig.suptitle("Wall-time per 1000 training steps  (mean ± std, 3 seeds)",
-                 fontsize=11, y=1.00)
     fig.tight_layout()
     out = RES / "comparison_wall.png"
     fig.savefig(str(out), dpi=140, bbox_inches="tight")

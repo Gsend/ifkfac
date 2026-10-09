@@ -239,6 +239,20 @@ def _positive_diagonal_R(R: torch.Tensor) -> torch.Tensor:
     return R * signs.unsqueeze(1)  # broadcast: each row of R scaled by sign
 
 
+def qr_R(A: torch.Tensor) -> torch.Tensor:
+    """R factor of the reduced QR of A (…, m, n).
+
+    dtype decides the kernel: bfloat16 input goes to the pure-bf16 Householder
+    routine (optimizer/bf16_linalg.py, bf16 in / bf16 out, requires m >= n);
+    fp32/fp64 input goes to torch.linalg.qr (cuSOLVER / LAPACK).  The dtype
+    of the input is the dtype of the output - nothing is upcast here.
+    """
+    if A.dtype == torch.bfloat16:
+        from optimizer.bf16_linalg import qr_r_bf16
+        return qr_r_bf16(A)
+    return torch.linalg.qr(A, mode="reduced")[1]
+
+
 # ---------------------------------------------------------------------------
 # 3. Streaming TSQR — for use inside hooks
 # ---------------------------------------------------------------------------
@@ -281,7 +295,7 @@ def streaming_tsqr_update(
                      else f"shape={tuple(running_R.shape)}")
 
     # Leaf QR of the new chunk
-    _, R_new = torch.linalg.qr(new_chunk, mode="reduced")
+    R_new = qr_R(new_chunk)
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("streaming_tsqr_update() leaf QR: R_new.shape=%s  "
@@ -297,7 +311,7 @@ def streaming_tsqr_update(
 
     # Merge step
     pair = torch.cat([running_R, R_new], dim=0)               # (2n, n)
-    _, R_merged = torch.linalg.qr(pair, mode="reduced")       # (n, n)
+    R_merged = qr_R(pair)                                     # (n, n)
     result = _positive_diagonal_R(R_merged)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("streaming_tsqr_update() done (merged): %s  "
@@ -370,11 +384,11 @@ def batched_streaming_tsqr_update(
         logger.debug("batched_streaming_tsqr_update: B=%d p=%d n=%d", B, p, n)
 
     # Stage 1: batched leaf QR  (B, p, n) -> (B, n, n)
-    _, R_leaf = torch.linalg.qr(new_chunks, mode="reduced")
+    R_leaf = qr_R(new_chunks)
 
     # Stage 2: batched merge QR  cat[(B,n,n), (B,n,n)] = (B, 2n, n) -> (B, n, n)
     pair = torch.cat([running_R, R_leaf], dim=1)
-    _, R_merged = torch.linalg.qr(pair, mode="reduced")
+    R_merged = qr_R(pair)
 
     return _positive_diagonal_R_batched(R_merged)
 
@@ -412,7 +426,7 @@ def finalize_R(
         n, device=running_R.device, dtype=running_R.dtype
     )
     pair = torch.cat([running_R, damp_rows], dim=0)           # (2n, n)
-    _, R_damped = torch.linalg.qr(pair, mode="reduced")       # (n, n)
+    R_damped = qr_R(pair)                                     # (n, n)
     result = _positive_diagonal_R(R_damped)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("finalize_R() done: %s  diag_min=%.4g diag_max=%.4g",
@@ -548,6 +562,23 @@ def apply_ifkfac_batched(
 # 4. apply_ifkfac — back-substitution preconditioner
 # ---------------------------------------------------------------------------
 
+def apply_ifkfac_pure_bf16(grad_W, R_X, R_G, S_X=None, S_G=None):
+    """G⁻¹ · grad_W · A⁻¹ with G = R_Gᵀ R_G, A = R_Xᵀ R_X, entirely in bf16.
+
+    grad_W (…, n_out, n_in), R_X (…, n_in, n_in), R_G (…, n_out, n_out), all
+    bf16; a leading batch dimension solves several layers at once.  Prebuilt
+    TriSolver objects (S_X, S_G) can be passed to reuse their inverted
+    diagonal blocks across steps.
+    """
+    from optimizer.bf16_linalg import TriSolver
+    S_G = S_G or TriSolver(R_G)
+    S_X = S_X or TriSolver(R_X)
+    T2 = S_G.solve(S_G.solve_t(grad_W))                         # G⁻¹ g
+    T2t = T2.transpose(-2, -1).contiguous()
+    T4t = S_X.solve(S_X.solve_t(T2t))                           # A⁻¹ (G⁻¹ g)ᵀ
+    return T4t.transpose(-2, -1)
+
+
 def apply_ifkfac(
     grad_W: torch.Tensor,
     R_X: torch.Tensor,
@@ -604,6 +635,11 @@ def apply_ifkfac(
     # at full cuSOLVER speed — not the 500ms-per-solve Python-loop path.
     # Defensive: if either R is non-square (layer still accumulating rows
     # for full-rank QR), fall back to the raw gradient for that layer.
+    if (grad_W.dtype == torch.bfloat16 and R_X.dtype == torch.bfloat16
+            and R_G.dtype == torch.bfloat16):
+        # Pure bf16 (bf16 model, bf16 factors): four bf16 triangular solves,
+        # bf16 in / bf16 out, no upcast (optimizer/bf16_linalg.TriSolver).
+        return apply_ifkfac_pure_bf16(grad_W, R_X, R_G)
     if R_X.dtype == torch.bfloat16 or R_G.dtype == torch.bfloat16:
         if R_X.shape[0] != R_X.shape[1]:
             print(f"[apply_ifkfac bf16] SKIP — R_X non-square: "
@@ -683,6 +719,10 @@ def apply_ifkfac_bias(
     # cuSOLVER triangular_solve.  Matches the bf16-storage / fp32-accumulate
     # regime that tensor cores use.  Defensive: if R is non-square, return
     # the raw gradient (equivalent to SGD for this layer this round).
+    if grad_b.dtype == torch.bfloat16 and R_G.dtype == torch.bfloat16:
+        from optimizer.bf16_linalg import TriSolver
+        S = TriSolver(R_G)
+        return S.solve(S.solve_t(grad_b.unsqueeze(1))).squeeze(1)
     if R_G.dtype == torch.bfloat16:
         if R_G.shape[0] != R_G.shape[1]:
             print(f"[apply_ifkfac_bias bf16] SKIP — R_G non-square: "

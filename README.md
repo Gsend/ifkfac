@@ -306,9 +306,26 @@ downloaded on first use. All commands run from the repository root.
 | §5.8 autoencoder screens | `python benchmark/autoencoder_mnist_screen.py` (and `_screen2`, `_screen3`, `_adamw_screen`, `_adamw_screen2`, `_adamw_bf16_screen`) | `ae_mnist_screen*_*.json`, `ae_mnist_adamw_*.json` |
 | §5.8 autoencoder multi-seed, Fig. 5 | `python benchmark/autoencoder_mnist.py`, then `python benchmark/plot_ae_walltime_loss.py` | `ae_mnist_{fp32,bf16}_*_seed*.json` |
 | §5.9 factor-level eigenvalue audit | `python -m benchmark.laplace_eig_audit`; ASDL probe: `python benchmark/probe_asdl_kappa.py --seed 42` | `laplace_eig_audit_seed*.json` |
-| §5.9 Table (exact-Fisher comparison, small MLP) | `python -m benchmark.fisher_approx_small --data mnist` and `--data digits` | `fisher_approx_small_*.json` |
-| Appendix A (ResNet-18 Laplace predictive) | `python -m benchmark.laplace_ekfac_2x2 --grid --smoke` | `laplace_cifar10_*_ps.json` |
+| Appendix A, Table 12 (exact-Fisher comparison, small MLP; summarized in §5.9) | `python -m benchmark.fisher_approx_small --data mnist` and `--data digits` | `fisher_approx_small_*.json` |
+| Appendix B (ResNet-18 Laplace predictive) | `python -m benchmark.laplace_ekfac_2x2 --grid --smoke` | `laplace_cifar10_*_ps.json` |
 | §5.2 / §5.7 IFKFAC bf16 with R stored in bf16 | `python -m benchmark.rerun_ifkfac_true_bf16` (`--damping` adds the §5.5 curve) | `per_step_bf16tb_*.json`, `per_step_4way_*_bf16tb_*.json` |
+| §5.2 / §5.5 / §5.7 / §5.8 Classic K-FAC with bf16-stored inverses (fixed patch) | `python -m benchmark.rerun_classic_bf16_fixed` (`--only 5.5` for the damping curve) | `per_step_bf16fix_*.json`, `per_step_4way_*_bf16fix_*.json`, `ae_mnist_bf16fix_*.json` |
+| Pure-bf16 experiments (bf16 model, gradients, optimizer state and K-FAC pipeline; no fp32 tensor anywhere) | check: `python -m benchmark.run_pure_bf16 --smoke` (every recipe x method under `benchmark/bf16_guard.py`); runs: `python -m benchmark.run_pure_bf16` and `--only 5.5` | `pure_bf16_smoke.json`, `*_bf16pure_*.json` |
+| Mixed precision with every K-FAC calculation in bf16 (fp32 master weights, bf16 autocast; Classic/IFKFAC `kfac_dtype=bf16`, SINGD `preconditioner_dtype=(bf16, bf16)`) | check: `python -m benchmark.run_amp_bf16 --smoke` (bf16 guard inside the K-FAC hooks and optimizer step, every recipe x method); runs: `python -m benchmark.run_amp_bf16` and `--only 5.5` | `amp_bf16_smoke.json`, `*_bf16amp_*.json` |
+| SINGD tuning screen in the same mixed-precision regime | `python -m benchmark.run_amp_singd_tune` | `singd_tune2_bf16amp_*.json` |
+
+Every bf16 run (`run_amp_bf16`, `run_pure_bf16`, `run_amp_singd_tune`) also
+verifies dtypes on every step (`optimizer/dtype_check.py`,
+`benchmark/bf16_checks.py`). Each K-FAC optimizer must be built in bf16 mode.
+Every tensor that enters the K-FAC computation (captured activations and output
+gradients, weight and bias gradients) must be bf16, and so must every
+statistic, factor, inverse, triangular solver and natural gradient it produces;
+SINGD's H terms, Kronecker factors and momenta are checked the same way.
+A mismatch stops the run with `DtypeCheckError`. The bf16-storage reruns
+(`rerun_ifkfac_true_bf16`, `rerun_classic_bf16_fixed`) check that the stored
+and applied factors are bf16. Each result file records the per-site check
+counts under `dtype_checks`, and `--summary` reports how many results were
+verified.
 
 All pending runs in one command (resumable; `--hours N` sets a time budget): `python -m benchmark.run_overnight`.
 

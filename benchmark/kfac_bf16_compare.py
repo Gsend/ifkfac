@@ -37,6 +37,7 @@ from benchmark.gpu_benchmark import SmallGPT, get_device, get_hardware_info
 import optimizer.raw_activation_hooks as rah
 import optimizer.sgso as sgso
 import optimizer.classic_kfac as ck
+from optimizer.dtype_check import expect_bf16_values
 
 
 # ---- bf16 monkey-patch for IFKFAC streaming TSQR + apply_ifkfac ------------
@@ -195,31 +196,55 @@ def disable_bf16():
             _vk.IFKFAC.__init__ = orig
 
 
-# ---- Classic bf16 patch: cast its cached A_inv/G_inv to bf16 -------------
-# Classic's step() does: nat_grad = G_inv @ grad_W @ A_inv
-# We cast inverses + grad to bf16, compute, cast back.
+# ---- Classic bf16 patch: store its cached A_inv/G_inv in bf16 -------------
+# Classic computes the damped inverses (A+lambda*I)^-1, (G+lambda*I)^-1 in fp32
+# at every refresh; this patch rounds them to bf16 right after they are
+# computed, so every step applies bf16-stored inverses (fp32 matmuls, fp32
+# gradient).  Only the cached inverses are rounded; the Gram EMA stays fp32.
+#
+# FIX (2026-09-27).  The previous version wrapped ClassicKFAC.step(): it
+# rounded a copy of the inverses, called step(), then restored the pre-step
+# dict.  On a refresh step that restore replaced the freshly computed
+# inverses with the (initially empty) old dict, so Classic never kept any
+# inverses: it applied unrounded fp32 inverses on the refresh step only and
+# fell back to plain SGD (no preconditioner, no momentum) on the other
+# factor_update_freq - 1 steps.  All "Classic bf16" training results made
+# with that version measure this artefact, not bf16 Classic K-FAC.
 
-_orig_classic_step = ck.ClassicKFAC.step
+_orig_classic_step = ck.ClassicKFAC.step            # kept for reference; not patched
+_orig_update_inverses = ck.ClassicKFAC._update_inverses
 
 
-def _classic_step_bf16(self):
-    # Quantize cached inverses to bf16 (precision loss) then back to fp32
-    # so the matmuls succeed but the values carry bf16 truncation.
-    orig_invs = {m: (Ai, Gi) for m, (Ai, Gi) in self._inverses.items()}
+def _update_inverses_bf16(self):
+    _orig_update_inverses(self)
     for m in list(self._inverses.keys()):
         Ai, Gi = self._inverses[m]
-        self._inverses[m] = (_bf16q(Ai), _bf16q(Gi))
-    out = _orig_classic_step(self)
-    self._inverses = orig_invs
-    return out
+        Ai, Gi = _bf16q(Ai), _bf16q(Gi)
+        expect_bf16_values("classic.storage.inverse_rounded", Ai, Gi)
+        self._inverses[m] = (Ai, Gi)
+
+
+def _check_applied_inverses(self, module, A_inv, G_inv):
+    """ClassicKFAC.inverse_check while the patch is on: the inverses a step
+    applies must hold bf16 values.  Each new pair of inverse tensors is
+    checked once (they are replaced, never modified, at a refresh)."""
+    seen = self.__dict__.setdefault("_bf16_checked_inverses", {})
+    last = seen.get(module)
+    if last is not None and last[0] is A_inv and last[1] is G_inv:
+        return
+    expect_bf16_values("classic.storage.inverse_applied", A_inv, G_inv)
+    seen[module] = (A_inv, G_inv)
 
 
 def enable_classic_bf16():
-    ck.ClassicKFAC.step = _classic_step_bf16
+    ck.ClassicKFAC._update_inverses = _update_inverses_bf16
+    ck.ClassicKFAC.inverse_check = _check_applied_inverses
 
 
 def disable_classic_bf16():
+    ck.ClassicKFAC._update_inverses = _orig_update_inverses
     ck.ClassicKFAC.step = _orig_classic_step
+    ck.ClassicKFAC.inverse_check = None
 
 
 # ---- Config + cells -------------------------------------------------------

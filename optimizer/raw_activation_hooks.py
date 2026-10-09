@@ -51,6 +51,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from optimizer.dtype_check import expect
+
 logger = logging.getLogger(__name__)
 
 
@@ -167,6 +169,15 @@ class RawActivationHooks(GramMatrixEstimator):
         # accumulation mode is active.
         self.chunk_transform_X = None
         self.chunk_transform_G = None
+        # dtype the K-FAC pipeline computes in.  None: keep the captured
+        # tensors' dtype.  torch.bfloat16: activations and output gradients are
+        # cast to bf16 on capture, so every later K-FAC stage runs in bf16 even
+        # when the model itself runs in mixed precision (fp32 master weights).
+        self.compute_dtype = None
+        # dtype the model itself must hand over (a bf16 model: activations and
+        # output gradients must already be bf16, so no cast can hide an upcast
+        # upstream).  Both are verified by optimizer.dtype_check on every call.
+        self.require_input_dtype = None
         if batched and deferred:
             raise ValueError("batched and deferred modes are mutually exclusive")
 
@@ -516,7 +527,13 @@ class RawActivationHooks(GramMatrixEstimator):
         """Streaming TSQR update for input activations X."""
         if not self._enabled:
             return
-        x = input[0].detach()
+        x = input[0]
+        if self.require_input_dtype is not None:
+            expect("ifkfac.hook.activation_from_model", x, dtype=self.require_input_dtype)
+        if self.compute_dtype is not None and x.dtype != self.compute_dtype:
+            with torch.no_grad():
+                x = x.to(self.compute_dtype)
+        x = x.detach()
         raw_shape = tuple(x.shape)
 
         if isinstance(module, nn.Conv2d):
@@ -556,6 +573,9 @@ class RawActivationHooks(GramMatrixEstimator):
                 "None" if self._R_X[module] is None
                 else str(tuple(self._R_X[module].shape)),
             )
+
+        if self.compute_dtype is not None:
+            expect("ifkfac.hook.activations", x, dtype=self.compute_dtype)
 
         if self.deferred:
             # Buffer chunks; merge in larger batches via streaming_tsqr_update
@@ -598,7 +618,13 @@ class RawActivationHooks(GramMatrixEstimator):
         """Streaming TSQR update for gradient signals δ."""
         if not self._enabled:
             return
-        delta = grad_output[0].detach()
+        delta = grad_output[0]
+        if self.require_input_dtype is not None:
+            expect("ifkfac.hook.output_grad_from_model", delta, dtype=self.require_input_dtype)
+        if self.compute_dtype is not None and delta.dtype != self.compute_dtype:
+            with torch.no_grad():
+                delta = delta.to(self.compute_dtype)
+        delta = delta.detach()
         raw_shape = tuple(delta.shape)
 
         if isinstance(module, nn.Conv2d):
@@ -623,6 +649,9 @@ class RawActivationHooks(GramMatrixEstimator):
                 "None" if self._R_G[module] is None
                 else str(tuple(self._R_G[module].shape)),
             )
+
+        if self.compute_dtype is not None:
+            expect("ifkfac.hook.output_grads", delta, dtype=self.compute_dtype)
 
         if self.deferred:
             self._raw_G[module].append(delta)

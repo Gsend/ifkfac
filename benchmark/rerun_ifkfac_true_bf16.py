@@ -56,6 +56,8 @@ import benchmark.comparison_4way_multiseed as C4
 import benchmark.damping_sweep_multiseed as DS
 from benchmark.stability_benchmark import OUT
 import optimizer.ifkfac_kfac as VK
+import optimizer.dtype_check as DC
+from benchmark import bf16_checks as BC
 
 TAG = {"precision": "bf16_true_storage", "r_storage": "bf16",
        "input_rounding": False,
@@ -97,6 +99,17 @@ def tag_file(p: Path):
             p.write_text(json.dumps(d, indent=2, default=str))
 
 
+def _cell(fn, path: Path, *args):
+    """One run with dtype checks: R must be stored as bf16 at every refresh and
+    every step must apply bf16 R factors; the counts go into the result file."""
+    already = path.exists()
+    DC.reset()
+    fn(*args)
+    if path.exists() and not already:
+        BC.record(path, json.loads(path.read_text()), methods=["ifkfac"], storage=True)
+    tag_file(path)
+
+
 # ---- runs --------------------------------------------------------------------
 def run_52(device, hw):
     from benchmark.stability_benchmark import build_data
@@ -104,17 +117,17 @@ def run_52(device, hw):
     pad = vocab - 1
     for arch_label, arch_kwargs in MS.ARCHS:
         for seed in MS.SEEDS:
-            MS.run_one(arch_label, arch_kwargs, "ifkfac", "IFKFAC", 1e-4, False,
-                       seed, tlf, vl, vocab, pad, device, hw)
-            tag_file(MS.out_path(arch_label, "ifkfac", seed))
+            _cell(MS.run_one, MS.out_path(arch_label, "ifkfac", seed),
+                  arch_label, arch_kwargs, "ifkfac", "IFKFAC", 1e-4, False,
+                  seed, tlf, vl, vocab, pad, device, hw)
 
 
 def run_57(device, hw):
     for arch in C4.ARCHS:
         ctx = C4.get_data(arch, device)
         for seed in C4.SEEDS:
-            C4.run_one(arch, "bf16", "ifkfac", seed, ctx, device, hw)
-            tag_file(C4.out_path(arch, "bf16", "ifkfac", seed))
+            _cell(C4.run_one, C4.out_path(arch, "bf16", "ifkfac", seed),
+                  arch, "bf16", "ifkfac", seed, ctx, device, hw)
 
 
 def run_55(device, hw):
@@ -123,8 +136,7 @@ def run_55(device, hw):
     pad = vocab - 1
     for seed in DS.SEEDS:
         for d in DS.DAMPINGS:
-            DS.run_cell("ifkfac", d, seed, tlf, vl, vocab, pad, device, hw)
-            tag_file(DS.new_path("ifkfac", d, seed))
+            _cell(DS.run_cell, DS.new_path("ifkfac", d, seed), "ifkfac", d, seed, tlf, vl, vocab, pad, device, hw)
 
 
 def smoke(device):
@@ -134,6 +146,7 @@ def smoke(device):
     import torch.nn.functional as F
     tlf, vl, vocab = build_data(device)
     pad = vocab - 1
+    DC.reset()
     torch.manual_seed(42)
     model = SmallGPT(vocab_size=vocab).to(device)
     kfac, emb, _ = make_optimizers("IFKFAC", model, 2e-3, 1e-4, 0.7, grad_clip=300.0,
@@ -151,6 +164,7 @@ def smoke(device):
     print(f"smoke: {len(kfac._factors)} layers with factors, stored dtypes {dtypes}, "
           f"loss at step 30 = {loss.item():.3f}", flush=True)
     assert kfac._factors and dtypes == {torch.bfloat16}, "R factors are not stored in bf16"
+    print("smoke " + BC.line(BC.run_summary(methods=["ifkfac"], storage=True)), flush=True)
     try:
         kfac.cleanup()
     except Exception:
@@ -197,6 +211,8 @@ def summary():
         print("\n=== §5.5 IFKFAC bf16 damping curve, final ppl (3 seeds) ===")
         for d, new, old in rows:
             print(f"  λ={d:.0e}  R-in-bf16: {_stats(new, 'final_ppl'):<24} original: {_stats(old, 'final_ppl')}")
+    res = ROOT / "benchmark" / "results"
+    BC.report(list(OUT.glob("*bf16tb_ifkfac*.json")) + list(res.glob("*bf16tb_ifkfac*.json")))
 
 
 def main():
